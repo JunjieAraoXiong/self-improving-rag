@@ -1,15 +1,53 @@
-# Self-Correcting RAG for Financial Document QA
+# Towards Expert Financial QA via Self-Improving RAG
 
-A multi-agent RAG framework with judge-driven self-correction for high-stakes document QA.
+**Accepted at the AFA Workshop @ ICLR 2026**
 
-**Paper**: Self-Correcting RAG: Judge-Driven Retrieval for Financial Document QA (FINAI@ICLR 2026)
+Junjie Xiong (UC Berkeley), Shawheen Ghezavat (Cal Poly), Aum Hirpara (Hofstra University), Sean Wu (Pepperdine University)
+
+[[Paper]](papers/iclr2026-finai-workshop/main.pdf)
+
+---
+
+Expert-level financial QA requires both **grounded verification** to catch numeric hallucinations and **audit trails** for regulatory compliance -- attributes that standard single-pass RAG systems lack. Self-Improving RAG decomposes document QA into three specialized agents (Retrieval, Reasoning, and Judge) coordinated by an orchestrator with feedback-driven self-correction. When the Judge scores an answer below a dynamic threshold, the system triggers retry with escalated strategies: broader retrieval, more careful prompting, and relaxed acceptance criteria.
+
+## Key Results (FinanceBench)
+
+- **86% oracle-guided accuracy** (+62.3% over single-pass RAG baseline)
+- **36.4% Lazarus Rate** -- recovers nearly 4 in 10 initially incorrect answers through targeted retry
+- A fixed retrieval pipeline with judge-driven retry achieves strong results **without dynamic routing**, providing full interpretability
+- Every decision is logged with confidence scores, enabling **audit trails** for regulated financial applications
 
 ## Key Features
 
-- **Three Specialized Agents**: Retrieval, Reasoning, and Judge agents with escalation strategies
-- **Self-Correction Loop**: Judge-driven retry when answers are below quality threshold
-- **Rule-Based Routing**: Zero-cost pipeline selection matching LLM-based routers
-- **Cross-Domain**: Works on Finance (FinanceBench), Medical (PubMedQA), and Legal (CUAD)
+- **Three Specialized Agents**: Retrieval, Reasoning, and Judge agents with per-attempt escalation
+- **Self-Correction Loop**: Judge-driven retry with dynamic threshold decay ($\tau_0{=}0.5$, $\lambda{=}0.1$, $\tau_{\min}{=}0.3$)
+- **Grounded Verification**: Entailment checking against retrieved evidence with programmatic numeric verification
+- **Audit-First Design**: Every agent decision logged with provenance, confidence scores, and reasoning traces
+- **Walled Garden Constraint**: Retrieval stays within authorized corpora -- no web search fallback, ensuring compliance
+
+## Architecture
+
+```
+                    ┌──────────────┐
+                    │ Orchestrator │
+                    └──────┬───────┘
+                           │
+              ┌────────────┼────────────┐
+              ▼            ▼            ▼
+        ┌───────────┐ ┌──────────┐ ┌─────────┐
+        │ Retrieval │ │Reasoning │ │  Judge   │
+        │   Agent   │ │  Agent   │ │  Agent   │
+        └───────────┘ └──────────┘ └─────────┘
+```
+
+The Orchestrator runs a retry loop (budget $B{=}2$, up to 3 attempts):
+
+1. **Retrieval Agent** retrieves evidence with escalation: $k{=}10 \to 20 \to 30$, RSE on final attempt
+2. **Reasoning Agent** generates answers with escalating prompts: Standard → Conservative → Detailed
+3. **Judge Agent** scores on three dimensions: grounding ($\mu_g$), completeness ($\mu_c$), numeric faithfulness ($\mu_n$)
+4. If $U_t = w_g\mu_g + w_c\mu_c + w_n\mu_n < \tau_t$, retry with escalation; otherwise accept
+
+Best answer is always kept -- retry never degrades output quality.
 
 ## Project Structure
 
@@ -26,22 +64,21 @@ rag/
 │   │   ├── hybrid.py        # BM25 + semantic ensemble
 │   │   ├── rerank.py        # Cross-encoder reranking
 │   │   ├── hyde.py          # Hypothetical Document Embeddings
-│   │   └── router.py        # Question-type routing
-│   ├── providers/           # LLM adapters (OpenAI, Anthropic, etc.)
-│   ├── meta_learning/       # Router training
+│   │   └── router.py        # Rule-based routing
+│   ├── providers/           # LLM adapters (OpenAI, Anthropic)
 │   ├── config.py            # Central configuration
 │   └── bulk_testing.py      # Evaluation entry point
 ├── evaluation/              # Metrics & LLM-as-Judge
-├── dataset_adapters/        # FinanceBench, PubMedQA, CUAD loaders
-└── scripts/                 # Experiment & training scripts
+├── dataset_adapters/        # FinanceBench loader
+└── scripts/                 # Experiment scripts
 ```
 
 ## Quick Start
 
 ### Installation
 ```bash
-git clone https://github.com/JunjieAraoXiong/algoverse-metalearning.git
-cd algoverse-metalearning/rag
+git clone https://github.com/JunjieAraoXiong/self-improving-rag.git
+cd self-improving-rag/rag
 pip install -r requirements.txt
 cp .env.example .env  # Add your API keys (OPENAI_API_KEY, ANTHROPIC_API_KEY)
 ```
@@ -55,7 +92,7 @@ python src/bulk_testing.py \
     --use-llm-judge
 ```
 
-### Run Self-Correcting RAG (Agentic Mode)
+### Run Self-Improving RAG (Agentic Mode)
 ```bash
 python src/bulk_testing.py \
     --dataset financebench \
@@ -63,165 +100,39 @@ python src/bulk_testing.py \
     --model gpt-4o-mini \
     --use-llm-judge \
     --use-agentic-retry \
-    --max-retries 1
+    --max-retries 2
 ```
-
-## Retrieval Pipelines
-
-| Pipeline | Description | When to Use |
-|----------|-------------|-------------|
-| `semantic` | Dense vector search | Simple factual queries |
-| `hybrid` | BM25 + semantic ensemble | Keyword-heavy queries |
-| `hybrid_filter` | Hybrid + metadata filtering | Entity-specific queries |
-| `hybrid_filter_rerank` | Full pipeline with reranking | Complex reasoning |
-| `routed` | Dynamic selection + retry | **Production (recommended)** |
-
-## Algorithm Overview
-
-The orchestrator implements a judge-driven retry loop:
-
-```
-while attempt <= max_retries:
-    docs = RetrievalAgent.retrieve(question, attempt)
-    answer = ReasoningAgent.generate(question, docs)
-    score = JudgeAgent.evaluate(question, answer)
-
-    if score >= threshold:
-        return answer
-
-    escalate_strategies()
-    attempt += 1
-```
-
-**Escalation strategies:**
-- **Retrieval**: Increase k (10 -> 20 -> 25), enable HyDE
-- **Reasoning**: Standard -> Conservative -> Detailed prompts
-- **Judge**: Lower threshold (0.5 -> 0.4 -> 0.3)
 
 ## Reproducing Results
 
 ### Step 1: Prepare ChromaDB
 ```bash
-# Download pre-built embeddings (recommended)
-# [Link to be added after publication]
-
-# Or build from scratch (requires SEC PDFs)
+# Build from scratch (requires SEC PDFs)
 python src/ingest_docling.py --input-dir data/pdfs --output-dir chroma_docling
 ```
 
 ### Step 2: Run Experiments
 ```bash
-# Table 1: Single-pass vs Self-Correcting RAG
+# Table 1: Single-pass vs Self-Improving RAG (oracle-guided)
 python src/bulk_testing.py --dataset financebench --pipeline hybrid_filter_rerank --model gpt-4o-mini --use-llm-judge
-python src/bulk_testing.py --dataset financebench --pipeline routed --model gpt-4o-mini --use-llm-judge --use-agentic-retry
+python src/bulk_testing.py --dataset financebench --pipeline routed --model gpt-4o-mini --use-llm-judge --use-agentic-retry --max-retries 2
 
-# Table 4: Cross-domain validation
-python src/bulk_testing.py --dataset pubmedqa --pipeline routed --model gpt-4o-mini --use-agentic-retry --domain medical
-python src/bulk_testing.py --dataset cuad --pipeline routed --model gpt-4o-mini --use-agentic-retry --domain legal
-```
-
-## Supported Models
-
-| Provider | Models | Notes |
-|----------|--------|-------|
-| OpenAI | gpt-4o-mini, gpt-4o | Recommended for evaluation |
-| Anthropic | claude-sonnet-4-5-20250514 | High quality |
-| Together | Llama 3.1 70B | For cluster deployment |
-
-## Provider Architecture
-
-The system uses a provider abstraction layer for multi-LLM support:
-
-```
-+------------------+
-|   User Code      |
-|  (bulk_testing)  |
-+--------+---------+
-         |
-         v
-+------------------+
-|  get_provider()  |  <-- Entry point
-+--------+---------+
-         |
-         v
-+------------------+
-|    config.py     |  <-- Routes model name to provider type
-+--------+---------+
-         |
-         v
-+------------------+
-|   factory.py     |  <-- Creates provider instances
-+--------+---------+
-         |
-         v
-+------------------+
-|  LLMProvider ABC |  <-- Abstract interface: generate(), embed()
-+--------+---------+
-         |
-    +----+----+
-    |    |    |
-    v    v    v
-+------+------+------+
-|OpenAI|Anthro|Togeth|  <-- Concrete implementations
-+------+------+------+
-```
-
-### What Works Well
-
-1. **Factory pattern** - Single `get_provider()` call handles all provider logic
-2. **Lazy loading** - Providers instantiated only when needed
-3. **Instance caching** - Same provider reused across calls
-4. **Standardized response** - All providers return `LLMResponse` dataclass
-5. **Config-driven routing** - Model names mapped to providers in `config.py`
-
-### Research-Grade Standards
-
-| Feature | Status | Notes |
-|---------|--------|-------|
-| Provider abstraction | Complete | ABC with OpenAI/Anthropic/Together |
-| Environment-based API keys | Complete | Via `python-dotenv` |
-| Usage tracking | Partial | Token counts returned but not aggregated |
-| Cost tracking | Missing | No per-request cost calculation |
-| Retry logic | Missing | No exponential backoff on failures |
-| Rate limiting | Missing | No request throttling |
-| Request logging | Missing | No structured logging for debugging |
-| Model versioning | Complete | Full model IDs in config |
-| Reproducibility | Partial | Seeds set but not logged with results |
-
-### Quick Win: Cost Tracking
-
-Add to `LLMResponse` dataclass:
-
-```python
-@dataclass
-class LLMResponse:
-    content: str
-    model: str
-    usage: dict
-    cost_usd: float = 0.0  # Add this field
-
-# In provider implementations:
-COST_PER_1K = {
-    "gpt-4o-mini": {"input": 0.00015, "output": 0.0006},
-    "gpt-4o": {"input": 0.005, "output": 0.015},
-    "claude-sonnet-4-5-20250514": {"input": 0.003, "output": 0.015},
-}
-
-def calculate_cost(model: str, usage: dict) -> float:
-    rates = COST_PER_1K.get(model, {"input": 0, "output": 0})
-    input_cost = (usage.get("prompt_tokens", 0) / 1000) * rates["input"]
-    output_cost = (usage.get("completion_tokens", 0) / 1000) * rates["output"]
-    return input_cost + output_cost
+# Table 3: Component ablation (deployment mode)
+python src/bulk_testing.py --dataset financebench --pipeline routed --model gpt-4o-mini --use-agentic-retry --max-retries 2
+python src/bulk_testing.py --dataset financebench --pipeline routed --model gpt-4o-mini --use-agentic-retry --max-retries 1
 ```
 
 ## Citation
 
+If you find this work useful, please cite:
+
 ```bibtex
-@inproceedings{anonymous2026selfcorrecting,
-  title={Self-Correcting RAG: Judge-Driven Retrieval for Financial Document QA},
-  author={Anonymous},
-  booktitle={FINAI Workshop at ICLR 2026},
-  year={2026}
+@inproceedings{xiong2026selfimproving,
+  title={Towards Expert Financial QA via Self-Improving RAG},
+  author={Xiong, Junjie and Ghezavat, Shawheen and Hirpara, Aum and Wu, Sean},
+  booktitle={AFA Workshop at the International Conference on Learning Representations (ICLR)},
+  year={2026},
+  url={https://github.com/JunjieAraoXiong/self-improving-rag}
 }
 ```
 

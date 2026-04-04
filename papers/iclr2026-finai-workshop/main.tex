@@ -1,5 +1,5 @@
-% Multi-Agent RAG: Self-Correcting Retrieval for Financial Document QA
-% FINAI@ICLR 2026 Workshop Paper
+% Towards Expert Financial QA via Self-Improving RAG
+% FINAI@ICLR 2026 Workshop Paper (4-page version)
 
 \documentclass{article}
 \usepackage{iclr2026_conference,times}
@@ -10,6 +10,11 @@
 \usepackage{booktabs}
 \usepackage{amsfonts}
 \usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{amsthm}
+\newtheorem{proposition}{Proposition}
+\usepackage{bbm}  % For indicator function \mathbbm{1}
+\DeclareMathOperator*{\argmax}{arg\,max}
 \usepackage{nicefrac}
 \usepackage{microtype}
 \usepackage{graphicx}
@@ -22,32 +27,51 @@
 \usepackage[most]{tcolorbox}
 
 % Title
-\title{Self-Correcting RAG: Judge-Driven Retrieval \\ for Financial Document QA}
+\title{Towards Expert Financial QA via Self-Improving RAG}
 
-% Authors - hidden for anonymous submission
-\author{Anonymous Authors}
+% Authors
+\author{
+  Junjie Xiong \\
+  University of California, Berkeley \\
+  \And
+  Shawheen Ghezavat \\
+  California Polytechnic State University \\
+  \And
+  Aum Hirpara \\
+  Hofstra University \\
+  \And
+  Sean Wu \\
+  Pepperdine University
+}
 
-% Uncomment for camera-ready version
-% \iclrfinalcopy
+% Uncomment for camera-ready (accepted):
+\iclrfinalcopy
 
 \begin{document}
+\raggedbottom  % Prevent excessive vertical spacing between sections
 
 \maketitle
 
 \begin{abstract}
-Deploying retrieval-augmented generation (RAG) in high-stakes finance requires two non-negotiable attributes: \textbf{numerical precision} in extraction and \textbf{audit trails} for regulatory compliance. Standard single-pass systems fail on both counts, frequently hallucinating figures while providing no transparent decision trace. We present Self-Correcting RAG, a framework that decomposes document QA into three specialized agents (Retrieval, Reasoning, and Judge) coordinated by an orchestrator with feedback-driven self-correction. When the Judge Agent scores an answer below a dynamic threshold, the system triggers retry with escalated strategies: broader retrieval, more careful prompting, and relaxed acceptance criteria. On FinanceBench (SEC filing QA), our approach recovers from failures that single-pass systems cannot detect, with largest gains on metrics-generated questions requiring numerical extraction. A key finding is that simple rule-based routing with judge-driven retry matches learned router performance while providing full interpretability. Every decision is logged with confidence scores, enabling the audit trails required for regulated financial applications. Cross-domain validation on medical (PubMedQA) and legal (CUAD) benchmarks confirms architectural robustness without domain-specific tuning.
+Expert-level financial question answering requires both \textbf{grounded verification} to catch numeric hallucinations and \textbf{audit trails} for regulatory compliance, attributes that standard single-pass RAG systems lack. We take a step toward this goal with Self-Improving RAG, a framework that decomposes document QA into three specialized agents (Retrieval, Reasoning, and Judge) coordinated by an orchestrator with feedback-driven self-correction. When the Judge Agent scores an answer below a dynamic threshold, the system triggers retry with escalated strategies: broader retrieval, more careful prompting, and relaxed acceptance criteria. We evaluate on FinanceBench (SEC filing QA), where Self-Improving RAG achieves 86\% oracle-guided accuracy (measuring agreement with gold answers) with a 36.4\% Lazarus Rate, recovering nearly 4 in 10 initially incorrect answers through targeted retry. A key finding is that a fixed retrieval pipeline with judge-driven retry achieves strong results without dynamic routing, providing full interpretability. Every decision is logged with confidence scores, enabling the audit trails required for regulated financial applications.
 \end{abstract}
 
-% Include sections
+% Main paper sections (4 pages excluding references)
 \input{intro}
 \input{related}
 \input{method}
-\input{experiments}
 \input{results}
 \input{conclusion}
 
-% Appendix: LLM Usage Disclosure
+% Bibliography
+\bibliography{references}
+\bibliographystyle{iclr2026_conference}
+
+% Appendix (does not count toward page limit)
 \appendix
+\input{appendix}
+
+% LLM Usage Disclosure
 \section*{Statement on LLM Usage}
 
 In accordance with ICLR's policy on Large Language Models, we declare:
@@ -58,11 +82,9 @@ In accordance with ICLR's policy on Large Language Models, we declare:
 agent that cross-referenced all claims against source abstracts via Semantic
 Scholar to ensure citation accuracy.
 
+\textbf{Figure Design:} AI tools assisted with figure design and layout.
+
 All technical contributions, experimental results, and analysis were conceived
 and verified by the authors.
-
-% Bibliography
-\bibliography{references}
-\bibliographystyle{iclr2026_conference}
 
 \end{document}
