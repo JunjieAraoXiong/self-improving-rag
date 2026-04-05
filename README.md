@@ -35,8 +35,8 @@ Expert-level financial QA requires both **grounded verification** to catch numer
               ┌────────────┼────────────┐
               ▼            ▼            ▼
         ┌───────────┐ ┌──────────┐ ┌─────────┐
-        │ Retrieval │ │Reasoning │ │  Judge   │
-        │   Agent   │ │  Agent   │ │  Agent   │
+        │ Retrieval │ │Reasoning │ │  Judge  │
+        │   Agent   │ │  Agent   │ │  Agent  │
         └───────────┘ └──────────┘ └─────────┘
 ```
 
