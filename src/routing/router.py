@@ -249,14 +249,7 @@ def get_router(model_dir: Optional[str] = None) -> Router:
     """
     if model_dir and Path(model_dir).exists():
         return Router.load(model_dir)
-    else:
-        # Fall back to rule-based
-        rule_router = RuleBasedRouter()
-        # Wrap in Router interface
-        router = Router()
-        router.predict = rule_router.predict
-        router.predict_with_confidence = rule_router.predict_with_confidence
-        return router
+    return RuleBasedRouter()
 
 
 # =============================================================================

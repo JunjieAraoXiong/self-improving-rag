@@ -1,7 +1,7 @@
 """Retrieval Agent: Decides retrieval strategy for each question."""
 
+import re
 from dataclasses import dataclass
-from datetime import datetime
 from typing import Any, Dict, List, Optional
 
 from langchain_core.documents import Document
@@ -158,7 +158,6 @@ class RetrievalAgent(BaseAgent):
     def _detect_company_name(self, question: str) -> bool:
         """Check if question mentions a company name."""
         # Simple heuristic: check for capitalized words that could be company names
-        import re
         pattern = r'\b[A-Z][a-z]+(?:\s+[A-Z][a-z]+)*\b'
         matches = re.findall(pattern, question)
         # Filter out common non-company words
@@ -168,7 +167,6 @@ class RetrievalAgent(BaseAgent):
 
     def _detect_fiscal_year(self, question: str) -> bool:
         """Check if question mentions a fiscal year."""
-        import re
         patterns = [
             r'\b20\d{2}\b',  # Years like 2020, 2021, etc.
             r'\bFY\s*\d{2,4}\b',  # FY22, FY2022
@@ -191,7 +189,7 @@ class RetrievalAgent(BaseAgent):
         ]
         question_lower = question.lower()
         for pattern in numeric_patterns:
-            if __import__('re').search(pattern, question_lower):
+            if re.search(pattern, question_lower):
                 return True
         return False
 
@@ -220,6 +218,7 @@ class RetrievalAgent(BaseAgent):
                 top_k=strategy.top_k,
                 initial_k_factor=strategy.initial_k_factor,
                 use_hyde=False,  # Override
+                use_rse=strategy.use_rse,
                 use_rerank=strategy.use_rerank,
             )
 

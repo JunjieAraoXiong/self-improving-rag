@@ -424,16 +424,26 @@ class RoutedPipeline(RetrievalPipeline):
             )
         return self._hyde_retriever
 
-    def retrieve(self, question: str) -> List[Document]:
+    def retrieve(
+        self,
+        question: str,
+        classification: Optional[ClassificationResult] = None,
+    ) -> List[Document]:
         """
         Classify question, route to appropriate strategy, and retrieve.
+
+        Args:
+            question: The question text.
+            classification: Pre-computed classification result. If provided,
+                skips the classify call to avoid redundant work.
 
         Respects skip_rerank flag from route config:
         - For HyDE path: skips reranker if skip_rerank=True
         - For standard path: uses non-rerank pipeline variant if skip_rerank=True
         """
-        # Step 1: Classify the question
-        classification = self.classifier.classify(question)
+        # Step 1: Classify the question (skip if already provided)
+        if classification is None:
+            classification = self.classifier.classify(question)
         question_type = classification.question_type
 
         # Step 2: Get route configuration
@@ -475,7 +485,7 @@ class RoutedPipeline(RetrievalPipeline):
         Useful for debugging and evaluation.
         """
         classification = self.classifier.classify(question)
-        docs = self.retrieve(question)
+        docs = self.retrieve(question, classification=classification)
 
         route = self.routes.get(classification.question_type, self.routes["domain-relevant"])
 

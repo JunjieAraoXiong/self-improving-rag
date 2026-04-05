@@ -1,14 +1,8 @@
 """Orchestrator: Coordinates all agents with retry logic."""
 
 import time
-from dataclasses import dataclass, asdict
-from datetime import datetime
-from pathlib import Path
+from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
-
-from langchain_core.documents import Document
-
-import re as _re
 
 from .base import AgentDecision
 from .retrieval_agent import RetrievalAgent
@@ -169,7 +163,8 @@ class AgenticRAGOrchestrator:
 
         # Snapshot token counts before this question for cost calculation
         tracker = get_usage_tracker()
-        tokens_before = tracker.total_prompt_tokens + tracker.total_completion_tokens
+        prompt_tokens_before = tracker.total_prompt_tokens
+        completion_tokens_before = tracker.total_completion_tokens
 
         # Generate question ID if not provided
         if question_id is None:
@@ -313,14 +308,13 @@ class AgenticRAGOrchestrator:
         total_time_ms = (time.time() - start_time) * 1000
 
         # Calculate cost for this question from token delta
-        tokens_after = tracker.total_prompt_tokens + tracker.total_completion_tokens
-        question_tokens = tokens_after - tokens_before
-        # Estimate cost using the generation model (most calls use this)
+        question_prompt_tokens = tracker.total_prompt_tokens - prompt_tokens_before
+        question_completion_tokens = tracker.total_completion_tokens - completion_tokens_before
         model_for_cost = self.config.llm_model or "gpt-4o-mini"
         question_cost = calculate_cost(model_for_cost, {
-            "prompt_tokens": tracker.total_prompt_tokens - (tokens_before - tracker.total_completion_tokens) if tokens_before > tracker.total_completion_tokens else question_tokens * 0.8,
-            "completion_tokens": question_tokens * 0.2,
-        }) if question_tokens > 0 else 0.0
+            "prompt_tokens": question_prompt_tokens,
+            "completion_tokens": question_completion_tokens,
+        }) if (question_prompt_tokens + question_completion_tokens) > 0 else 0.0
         self.total_cost_usd += question_cost
         self.total_prompt_tokens = tracker.total_prompt_tokens
         self.total_completion_tokens = tracker.total_completion_tokens
