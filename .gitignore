@@ -1,0 +1,40 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+
+# Environment
+.env
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# OS
+.DS_Store
+
+# Data (large files, download separately)
+data/pdfs/
+chroma_docling/
+*.zip
+*.bin
+*.pickle
+
+# Generated outputs
+bulk_runs/
+logs/
+agent_logs*/
+traces/
+results/
+oracle_labels/
+models/
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
