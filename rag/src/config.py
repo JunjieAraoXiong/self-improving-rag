@@ -414,6 +414,7 @@ PROVIDERS: Dict[str, ProviderConfig] = {
             "claude-sonnet-4-5-20250514",
             "claude-opus-4-5-20250514",
             "claude-sonnet-4-20250514",
+            "claude-3-haiku-20240307",  # Cheapest - $0.25/$1.25 per 1M tokens
         ],
     ),
     "google": ProviderConfig(
@@ -446,6 +447,12 @@ PROVIDERS: Dict[str, ProviderConfig] = {
         api_key_env="EMPTY_KEY",  # vLLM doesn't need a real key, but provider might check existence
         models=["meta-llama/Meta-Llama-3.1-70B-Instruct"],
     ),
+    "xai": ProviderConfig(
+        name="xai",
+        base_url="https://api.x.ai/v1",
+        api_key_env="XAI_API_KEY",
+        models=["grok-3", "grok-3-mini", "grok-4-1-fast-non-reasoning"],
+    ),
 }
 
 
@@ -458,6 +465,8 @@ def get_provider_for_model(model_name: str) -> str:
         return "anthropic"
     elif model_lower.startswith("gemini-"):
         return "google"
+    elif model_lower.startswith("grok-"):
+        return "xai"
     elif "deepseek" in model_lower and not model_lower.startswith("deepseek-ai/"):
         return "deepseek"
     elif "meta-llama" in model_lower:
@@ -629,7 +638,7 @@ def get_routes_for_domain(domain: str) -> Dict[str, RouteConfig]:
 class Defaults:
     """Default values for the RAG system."""
     # Model defaults
-    llm_model: str = "claude-sonnet-4-5-20250514"
+    llm_model: str = "gpt-4o-mini"  # Cost-effective, works reliably
     embedding_model: str = "bge-large"  # FREE local embedding (was text-embedding-3-large)
     reranker_model: str = "BAAI/bge-reranker-large"  # Also FREE local
     judge_model: str = "gpt-4o-mini"  # Was claude-sonnet-4-5-20250514 (404 error)
@@ -650,7 +659,7 @@ class Defaults:
     router_hyde_model: str = "gpt-4o-mini"
 
     # Paths (relative to project root)
-    chroma_path: str = "chroma"
+    chroma_path: str = "chroma_docling"
     output_dir: str = "bulk_runs"
 
 
@@ -666,6 +675,7 @@ MODEL_ABBREVS: Dict[str, str] = {
     "claude-sonnet-4-5": "claude45-sonnet",
     "claude-opus-4-5": "claude45-opus",
     "claude-sonnet-4": "claude4-sonnet",
+    "claude-3-haiku": "claude3-haiku",
     # GPT
     "gpt-5.2-mini": "gpt52-mini",
     "gpt-5.2": "gpt52",
@@ -689,6 +699,10 @@ MODEL_ABBREVS: Dict[str, str] = {
     "qwen3-coder": "qwen3-coder",
     # Kimi
     "kimi-k2": "kimi-k2",
+    # Grok (xAI)
+    "grok-3-mini": "grok3-mini",
+    "grok-3": "grok3",
+    "grok-4-1-fast": "grok4-fast",
 }
 
 
@@ -700,6 +714,71 @@ def get_model_abbrev(model_name: str) -> str:
             return abbrev
     # Fallback: use last part of model name
     return model_name.split("/")[-1][:20]
+
+
+# =============================================================================
+# Cost Tracking (USD per 1K tokens)
+# =============================================================================
+
+COST_PER_1K_TOKENS: Dict[str, Dict[str, float]] = {
+    # OpenAI
+    "gpt-4o-mini": {"input": 0.00015, "output": 0.0006},
+    "gpt-4o": {"input": 0.0025, "output": 0.01},
+    "gpt-5.2": {"input": 0.003, "output": 0.012},
+    "gpt-5.2-mini": {"input": 0.0004, "output": 0.0016},
+    # Anthropic
+    "claude-sonnet-4-5-20250514": {"input": 0.003, "output": 0.015},
+    "claude-opus-4-5-20250514": {"input": 0.015, "output": 0.075},
+    "claude-sonnet-4-20250514": {"input": 0.003, "output": 0.015},
+    "claude-3-haiku-20240307": {"input": 0.00025, "output": 0.00125},
+    # Google
+    "gemini-3-pro-preview": {"input": 0.00125, "output": 0.005},
+    "gemini-3-flash-preview": {"input": 0.00015, "output": 0.0006},
+    "gemini-2.5-pro": {"input": 0.00125, "output": 0.01},
+    "gemini-2.0-flash": {"input": 0.0001, "output": 0.0004},
+    # Together / Open-source
+    "meta-llama/Llama-4-Maverick-17B-128E-Instruct-FP8": {"input": 0.00027, "output": 0.00085},
+    "meta-llama/Meta-Llama-3.1-70B-Instruct-Turbo": {"input": 0.00088, "output": 0.00088},
+    "deepseek-ai/DeepSeek-V3": {"input": 0.0005, "output": 0.0005},
+    "Qwen/Qwen2.5-72B-Instruct-Turbo": {"input": 0.0012, "output": 0.0012},
+    "moonshotai/Kimi-K2-Instruct": {"input": 0.0006, "output": 0.0006},
+    # DeepSeek direct
+    "deepseek-chat": {"input": 0.00027, "output": 0.0011},
+    "deepseek-reasoner": {"input": 0.00055, "output": 0.0022},
+    # xAI
+    "grok-3": {"input": 0.003, "output": 0.015},
+    "grok-3-mini": {"input": 0.0003, "output": 0.0005},
+    "grok-4-1-fast-non-reasoning": {"input": 0.003, "output": 0.015},
+}
+
+
+def calculate_cost(model_name: str, usage: dict) -> float:
+    """Calculate USD cost from token usage.
+
+    Args:
+        model_name: Model name (matched against COST_PER_1K_TOKENS keys)
+        usage: Dict with 'prompt_tokens' and 'completion_tokens'
+
+    Returns:
+        Cost in USD
+    """
+    # Find matching cost entry (partial match for model name prefixes)
+    rates = COST_PER_1K_TOKENS.get(model_name)
+    if rates is None:
+        # Try partial match
+        model_lower = model_name.lower()
+        for key, val in COST_PER_1K_TOKENS.items():
+            if key.lower() in model_lower or model_lower in key.lower():
+                rates = val
+                break
+    if rates is None:
+        return 0.0
+
+    prompt_tokens = usage.get("prompt_tokens", 0) or 0
+    completion_tokens = usage.get("completion_tokens", 0) or 0
+    input_cost = (prompt_tokens / 1000) * rates["input"]
+    output_cost = (completion_tokens / 1000) * rates["output"]
+    return input_cost + output_cost
 
 
 # =============================================================================

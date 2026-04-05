@@ -1,7 +1,9 @@
 """Judge Agent: Evaluates answers and decides whether to retry.
 
 Includes a deterministic verification gate that runs BEFORE LLM-as-judge
-to catch answers lacking proper evidence citations.
+to catch answers lacking proper evidence citations. In blind mode (no gold
+answer), uses numeric grounding verification to check that all numbers in
+the answer are supported by the retrieved documents.
 """
 
 from datetime import datetime
@@ -15,6 +17,7 @@ from evaluation.deterministic_verify import (
     deterministic_verify,
     format_verification_feedback,
 )
+from evaluation.numeric_check import extract_numbers, NumericValue
 
 
 class JudgeAgent(BaseAgent):
@@ -68,13 +71,19 @@ class JudgeAgent(BaseAgent):
         question: str,
         predicted_answer: str,
         gold_answer: str = None,
+        docs: List[Document] = None,
     ) -> Tuple[float, str]:
         """Evaluate the predicted answer.
+
+        In blind mode (no gold_answer), combines LLM self-evaluation with
+        numeric grounding verification against source documents for a
+        stronger quality signal.
 
         Args:
             question: The original question
             predicted_answer: The model's answer
             gold_answer: The reference answer (if available)
+            docs: Retrieved source documents (used for blind numeric verification)
 
         Returns:
             Tuple of (score, justification)
@@ -92,8 +101,32 @@ class JudgeAgent(BaseAgent):
                 judge_model=self.judge_model,
             )
         else:
-            # Self-evaluation without gold answer (check for coherence, specificity)
-            score, justification = self._self_evaluate(question, predicted_answer)
+            # Blind evaluation: LLM self-eval + numeric grounding
+            llm_score, llm_justification = self._self_evaluate(question, predicted_answer)
+
+            # Augment with numeric grounding check against source documents
+            if docs:
+                grounding_score, grounding_explanation = self._blind_numeric_verify(
+                    predicted_answer, docs
+                )
+
+                # Combine: weight numeric grounding heavily for financial QA
+                # LLM self-eval captures coherence/relevance (weight: 0.4)
+                # Numeric grounding captures factual accuracy (weight: 0.6)
+                score = 0.4 * llm_score + 0.6 * grounding_score
+
+                justification = (
+                    f"[Blind eval] LLM: {llm_score:.2f} ({llm_justification}). "
+                    f"Numeric grounding: {grounding_score:.2f} ({grounding_explanation})"
+                )
+
+                # Hard override: if most numbers are ungrounded, force low score
+                if grounding_score < 0.3:
+                    score = min(score, 0.25)
+                    justification += " [OVERRIDE: majority of numbers ungrounded]"
+            else:
+                score = llm_score
+                justification = llm_justification
 
         return score, justification
 
@@ -147,6 +180,93 @@ Evaluate the quality of this answer."""
             return parse_judge_response(response.content)
         except Exception as e:
             return 0.0, f"Self-evaluation failed: {str(e)}"
+
+    def _blind_numeric_verify(
+        self,
+        answer: str,
+        docs: List[Document],
+        relative_tolerance: float = 0.05,
+    ) -> Tuple[float, str]:
+        """Verify that numbers in the answer are grounded in source documents.
+
+        This is the key blind verification signal: without gold answers, we check
+        that every significant number in the answer appears (within tolerance) in
+        at least one retrieved document. Ungrounded numbers are likely hallucinated.
+
+        Args:
+            answer: The generated answer
+            docs: Retrieved source documents
+            relative_tolerance: Acceptable relative difference (default 5%)
+
+        Returns:
+            Tuple of (grounding_score 0-1, explanation)
+        """
+        if not answer or not docs:
+            return 0.5, "No answer or documents to verify"
+
+        # Extract numbers from answer (high-confidence only)
+        answer_nums = extract_numbers(answer)
+        # Filter to significant numbers (skip years, small integers likely to be ordinals)
+        significant_nums = [
+            n for n in answer_nums
+            if n.confidence >= 0.5
+            and not (1900 <= n.value <= 2100 and n.unit == "")  # Skip standalone years
+            and abs(n.value) > 1  # Skip trivially small numbers
+        ]
+
+        if not significant_nums:
+            return 0.7, "No significant numeric claims to verify"
+
+        # Extract numbers from all source documents
+        source_text = " ".join(doc.page_content for doc in docs)
+        source_nums = extract_numbers(source_text)
+        source_values = [n.value for n in source_nums]
+
+        if not source_values:
+            # Documents have no numbers but answer does -- suspicious
+            if significant_nums:
+                return 0.2, f"Answer contains {len(significant_nums)} numbers but sources contain none"
+            return 0.5, "Neither answer nor sources contain numbers"
+
+        # Check each answer number against source numbers
+        grounded = []
+        ungrounded = []
+
+        for ans_num in significant_nums:
+            found_match = False
+            for src_val in source_values:
+                if src_val == 0:
+                    if ans_num.value == 0:
+                        found_match = True
+                        break
+                    continue
+
+                rel_diff = abs(ans_num.value - src_val) / abs(src_val)
+                if rel_diff <= relative_tolerance:
+                    found_match = True
+                    break
+
+            if found_match:
+                grounded.append(ans_num)
+            else:
+                ungrounded.append(ans_num)
+
+        # Calculate grounding ratio
+        total = len(significant_nums)
+        grounded_count = len(grounded)
+        grounding_ratio = grounded_count / total if total > 0 else 1.0
+
+        # Build explanation
+        if ungrounded:
+            ungrounded_strs = [f"{n.raw} ({n.value:,.2f})" for n in ungrounded[:3]]
+            explanation = (
+                f"Numeric grounding: {grounded_count}/{total} numbers verified in sources. "
+                f"Ungrounded: {', '.join(ungrounded_strs)}"
+            )
+        else:
+            explanation = f"Numeric grounding: all {total} numbers verified in sources"
+
+        return grounding_ratio, explanation
 
     def run_deterministic_verification(
         self,
@@ -264,7 +384,8 @@ Evaluate the quality of this answer."""
                     )
 
         # Deterministic check passed - proceed to LLM-as-judge evaluation
-        score, justification = self.evaluate(question, predicted_answer, gold_answer)
+        # Pass docs for blind numeric verification when no gold answer
+        score, justification = self.evaluate(question, predicted_answer, gold_answer, docs=docs)
 
         # Track score for this attempt
         self._attempt_scores.append(score)

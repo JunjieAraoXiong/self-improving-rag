@@ -36,12 +36,21 @@ class NumericVerificationResult:
 
 
 # Multiplier mappings for text-based numbers
+# Note: single-char abbreviations (M, B, K) are only matched when preceded
+# by a dollar sign or number (see NUMBER_PATTERN). This avoids collisions
+# with unit suffixes like "m" (meters) in non-financial contexts.
 MULTIPLIERS = {
     'thousand': 1e3,
+    'thousands': 1e3,
     'k': 1e3,
     'million': 1e6,
+    'millions': 1e6,
+    'mn': 1e6,
+    'mm': 1e6,  # Common in finance (double-M for millions)
     'm': 1e6,
     'billion': 1e9,
+    'billions': 1e9,
+    'bn': 1e9,
     'b': 1e9,
     'trillion': 1e12,
     't': 1e12,
@@ -134,15 +143,19 @@ def extract_numbers(text: str) -> List[Tuple[str, float]]:
     return results
 
 
-def numbers_match(value1: float, value2: float, tolerance: float = 0.001) -> bool:
+def numbers_match(value1: float, value2: float, tolerance: float = 0.02) -> bool:
     """Check if two numbers match within tolerance.
 
     Uses relative tolerance for large numbers, absolute for small.
+    Also checks if values differ by a known scale factor (thousands vs
+    millions), which is a common format variation in financial documents
+    (e.g., "$394.3 billion" vs "$394,300 million").
 
     Args:
         value1: First number
         value2: Second number
-        tolerance: Relative tolerance (default 0.1%)
+        tolerance: Relative tolerance (default 2% -- relaxed from 0.1%
+                   to handle rounding differences in financial reports)
 
     Returns:
         True if numbers match within tolerance
@@ -150,17 +163,27 @@ def numbers_match(value1: float, value2: float, tolerance: float = 0.001) -> boo
     if value1 == value2:
         return True
     if value1 == 0 or value2 == 0:
-        return abs(value1 - value2) < tolerance
+        return abs(value1 - value2) < 0.01
 
     # Relative tolerance for non-zero values
     relative_diff = abs(value1 - value2) / max(abs(value1), abs(value2))
-    return relative_diff <= tolerance
+    if relative_diff <= tolerance:
+        return True
+
+    # Check scale-factor matches: same number expressed in different units
+    # e.g., 394.3 (billions) vs 394300 (millions) → ratio = 1000
+    ratio = value1 / value2 if value2 != 0 else float('inf')
+    for scale in [1000, 1_000_000]:
+        if abs(ratio - scale) / scale < tolerance or abs(ratio - 1/scale) * scale < tolerance:
+            return True
+
+    return False
 
 
 def verify_numeric_answer(
     predicted_answer: str,
     retrieved_chunks: List,
-    tolerance: float = 0.001
+    tolerance: float = 0.02
 ) -> NumericVerificationResult:
     """Verify that numbers in a generated answer exist in source chunks.
 

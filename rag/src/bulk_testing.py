@@ -4,14 +4,31 @@ import sys
 import time
 import json
 import argparse
-from dataclasses import dataclass, asdict
+import random
+from dataclasses import dataclass, asdict, field
 from datetime import datetime
 from pathlib import Path
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List
 
+import numpy as np
 import pandas as pd
 from dotenv import load_dotenv
 from tqdm import tqdm
+
+
+def set_global_seed(seed: int) -> None:
+    """Set global random seeds for reproducibility.
+
+    Initializes random state for Python's random module and NumPy.
+    This ensures reproducible results across runs when the same seed is used.
+
+    Args:
+        seed: Integer seed value for reproducibility
+    """
+    random.seed(seed)
+    np.random.seed(seed)
+    # Note: If using torch in the future, add torch.manual_seed(seed)
+    print(f"  Global seed set to: {seed}")
 
 # Add parent directory to path for imports
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -24,7 +41,13 @@ from dataset_adapters import BaseDatasetAdapter, FinanceBenchAdapter, FinQAAdapt
 from evaluation.metrics import (
     embedding_similarity,
     calculate_aggregate_metrics,
-    format_metrics_summary
+    format_metrics_summary,
+    bootstrap_ci,
+    bootstrap_compare,
+)
+from evaluation.latex_tables import (
+    generate_results_table,
+    significance_marker,
 )
 from evaluation.llm_judge import llm_as_judge
 from evaluation.numeric_check import numeric_match
@@ -98,12 +121,20 @@ class BulkTestConfig:
     agent_log_dir: str = "agent_logs"  # Directory for agent decision logs
     blind_judge: bool = False  # If True, Judge uses self-evaluation (no gold answer)
 
+    # Table reasoning settings (rLLM-FinQA integration)
+    use_table_agent: bool = False  # Route numeric computation to TableAgent
+    vllm_base_url: str = None  # vLLM server URL for rLLM-FinQA-4B model
+
     # Ablation study settings
     ablation: str = None  # Ablation mode to run
     ablation_no_retrieval_escalation: bool = False
     ablation_no_prompt_escalation: bool = False
     ablation_no_hyde: bool = False
     ablation_no_deterministic_verify: bool = False
+
+    # Reproducibility settings
+    seed: int = 42  # Global random seed for reproducibility
+    run_id: int = 0  # Current run index (0-indexed) for multi-run experiments
 
     # Runtime metadata
     timestamp: str = None
@@ -125,11 +156,19 @@ class BulkTestConfig:
         """Get abbreviated model name for filename."""
         return get_model_abbrev(self.model_name)
 
-    def generate_filename(self, dataset_abbrev: str) -> str:
-        """Generate output filename from configuration."""
+    def generate_filename(self, dataset_abbrev: str, include_run: bool = False) -> str:
+        """Generate output filename from configuration.
+
+        Args:
+            dataset_abbrev: Short name for the dataset
+            include_run: If True, include run_id in filename for multi-run experiments
+        """
         model_abbrev = self.get_model_abbrev()
         temp_str = f"t{self.temperature}".replace(".", "")
-        return f"{self.timestamp}_{dataset_abbrev}_{model_abbrev}_k{self.top_k_retrieval}_{temp_str}.csv"
+        base = f"{self.timestamp}_{dataset_abbrev}_{model_abbrev}_k{self.top_k_retrieval}_{temp_str}"
+        if include_run:
+            return f"{base}_seed{self.seed}_run{self.run_id}.csv"
+        return f"{base}.csv"
 
 
 class BulkTestRunner:
@@ -418,12 +457,28 @@ Plan and Answer:"""
         print(f"\nProcessing complete! Total time: {time.time() - start_time:.2f}s")
         return pd.DataFrame(results)
 
-    def _save_results(self, results_df: pd.DataFrame, adapter: BaseDatasetAdapter, partial: bool = False):
-        """Save results to CSV and summary to JSON."""
+    def _save_results(
+        self,
+        results_df: pd.DataFrame,
+        adapter: BaseDatasetAdapter,
+        partial: bool = False,
+        include_run: bool = False,
+    ) -> Optional[Path]:
+        """Save results to CSV and summary to JSON.
+
+        Args:
+            results_df: DataFrame with evaluation results
+            adapter: Dataset adapter for naming
+            partial: If True, mark as partial results (interrupted run)
+            include_run: If True, include run_id in filename (for multi-run experiments)
+
+        Returns:
+            Path to the saved CSV file, or None on error
+        """
         output_dir = Path(self.config.output_dir)
         output_dir.mkdir(exist_ok=True)
 
-        filename = self.config.generate_filename(adapter.name)
+        filename = self.config.generate_filename(adapter.name, include_run=include_run)
         if partial:
             filename = filename.replace('.csv', '_PARTIAL.csv')
 
@@ -436,6 +491,9 @@ Plan and Answer:"""
         # Calculate and save metrics
         metrics = calculate_aggregate_metrics(results_df)
         metrics['config'] = asdict(self.config)
+        # Add seed info for reproducibility
+        metrics['seed'] = self.config.seed
+        metrics['run_id'] = self.config.run_id
 
         summary_path = output_path.with_suffix('.json')
         with open(summary_path, 'w') as f:
@@ -444,9 +502,11 @@ Plan and Answer:"""
         print(f"Summary saved to: {summary_path}")
         print(format_metrics_summary(metrics))
 
+        return output_path
+
     def save_results(self, results_df: pd.DataFrame, adapter: BaseDatasetAdapter):
         """Public method to save results."""
-        self._save_results(results_df, adapter, partial=False)
+        return self._save_results(results_df, adapter, partial=False)
 
     def run_agentic_test(self, adapter: BaseDatasetAdapter) -> pd.DataFrame:
         """Run agentic RAG test with self-correcting retry loop.
@@ -508,6 +568,9 @@ Plan and Answer:"""
             enable_logging=True,
             temperature=self.config.temperature,
             max_tokens=self.config.max_tokens,
+            # Table reasoning settings
+            use_table_agent=self.config.use_table_agent,
+            vllm_base_url=getattr(self.config, 'vllm_base_url', None),
             # Ablation study settings
             ablation_no_retrieval_escalation=self.config.ablation_no_retrieval_escalation,
             ablation_no_prompt_escalation=self.config.ablation_no_prompt_escalation,
@@ -688,6 +751,10 @@ def main():
         help='Enable LLM-as-a-Judge evaluation'
     )
     parser.add_argument(
+        '--judge-model', type=str, default=None,
+        help='Model for LLM-as-Judge (default: same as --model). Use for cross-model judging.'
+    )
+    parser.add_argument(
         '--use-numeric-verify', action='store_true',
         help='Enable numeric verification to detect hallucinated numbers'
     )
@@ -749,6 +816,16 @@ def main():
         help='Use blind judge mode: Judge evaluates without seeing gold answer (for realistic TPR/FPR)'
     )
 
+    # Table reasoning arguments (rLLM-FinQA integration)
+    parser.add_argument(
+        '--use-table-agent', action='store_true',
+        help='Enable TableAgent for numeric computation via SQL + calculator (requires rLLM)'
+    )
+    parser.add_argument(
+        '--vllm-base-url', type=str, default=None,
+        help='vLLM server URL for rLLM-FinQA-4B model (e.g., http://localhost:30000/v1)'
+    )
+
     # Ablation study arguments
     parser.add_argument(
         '--ablation', type=str, default=None,
@@ -760,6 +837,16 @@ def main():
             'no_judge',  # Equivalent to max_retries=0
         ],
         help='Run ablation study by disabling specific components'
+    )
+
+    # Reproducibility arguments (ICLR requirements)
+    parser.add_argument(
+        '--seed', type=int, default=42,
+        help='Global random seed for reproducibility (default: 42)'
+    )
+    parser.add_argument(
+        '--num-runs', type=int, default=1,
+        help='Number of independent runs with different seeds (default: 1). Seeds will be base_seed, base_seed+1, ...'
     )
 
     args = parser.parse_args()
@@ -776,7 +863,7 @@ def main():
         temperature=args.temperature,
         max_tokens=args.max_tokens,
         use_llm_judge=args.use_llm_judge,
-        judge_model=args.judge_model,
+        judge_model=args.judge_model or DEFAULTS.judge_model,
         router_classifier_model=args.router_classifier_model,
         router_hyde_model=args.router_hyde_model,
         use_rule_router=args.use_rule_router,
@@ -789,8 +876,13 @@ def main():
         retry_threshold=args.retry_threshold,
         agent_log_dir=args.agent_log_dir,
         blind_judge=args.blind_judge,
+        # Table reasoning settings
+        use_table_agent=args.use_table_agent,
+        vllm_base_url=args.vllm_base_url,
         # Ablation settings
         ablation=args.ablation,
+        # Reproducibility settings
+        seed=args.seed,
     )
 
     # Handle ablation mode - set appropriate flags
@@ -820,7 +912,7 @@ def main():
             if ds == 'pubmedqa':
                 config.chroma_path = str(Path(__file__).parent.parent / "chroma_medical")
             elif ds == 'financebench':
-                config.chroma_path = str(Path(__file__).parent.parent / "chroma")
+                config.chroma_path = str(Path(__file__).parent.parent / "chroma_docling")
             elif ds == 'finqa':
                 config.chroma_path = str(Path(__file__).parent.parent / "chroma_finqa")
             elif ds == 'cuad':
@@ -854,23 +946,243 @@ def main():
         print("Available datasets: financebench, finqa, pubmedqa, cuad")
         sys.exit(1)
 
-    # Create runner and execute
-    runner = BulkTestRunner(config)
+    # Multi-run support for ICLR-class reproducibility
+    num_runs = args.num_runs
+    base_seed = args.seed
+    all_run_results = []  # Store DataFrames from each run
+    all_run_paths = []  # Store paths to individual run files
 
-    try:
-        if config.use_agentic_retry:
-            # Run agentic RAG with retry loop
-            results_df = runner.run_agentic_test(adapter)
-            runner.save_results(results_df, adapter)
+    print("\n" + "=" * 60)
+    print(f"EXPERIMENT CONFIGURATION")
+    print("=" * 60)
+    print(f"  Dataset:    {args.dataset}")
+    print(f"  Pipeline:   {config.pipeline_id}")
+    print(f"  Model:      {config.model_name}")
+    print(f"  Base seed:  {base_seed}")
+    print(f"  Num runs:   {num_runs}")
+    if config.use_agentic_retry:
+        print(f"  Mode:       Agentic RAG (max_retries={config.max_retries})")
+        if config.use_table_agent:
+            print(f"  TableAgent: ON (vllm={config.vllm_base_url or 'LLM fallback'})")
+    else:
+        print(f"  Mode:       Standard RAG")
+    print("=" * 60)
+
+    # Write experiment manifest for reproducibility
+    manifest_dir = Path(config.output_dir)
+    manifest_dir.mkdir(parents=True, exist_ok=True)
+    manifest = {
+        "timestamp": config.timestamp,
+        "dataset": args.dataset,
+        "pipeline": config.pipeline_id,
+        "model": config.model_name,
+        "judge_model": config.judge_model,
+        "seed": base_seed,
+        "num_runs": num_runs,
+        "use_agentic_retry": config.use_agentic_retry,
+        "max_retries": config.max_retries,
+        "use_table_agent": config.use_table_agent,
+        "vllm_base_url": config.vllm_base_url,
+        "blind_judge": config.blind_judge,
+        "top_k": config.top_k_retrieval,
+        "temperature": config.temperature,
+        "embedding_model": config.embedding_model,
+        "reranker_model": config.reranker_model,
+        "ablation": config.ablation,
+    }
+    manifest_path = manifest_dir / f"manifest_{config.timestamp}.json"
+    with open(manifest_path, 'w') as f:
+        json.dump(manifest, f, indent=2)
+    print(f"  Manifest:   {manifest_path}")
+
+    for run_idx in range(num_runs):
+        current_seed = base_seed + run_idx
+        config.seed = current_seed
+        config.run_id = run_idx
+
+        print(f"\n{'='*60}")
+        print(f"RUN {run_idx + 1}/{num_runs} (seed={current_seed})")
+        print(f"{'='*60}")
+
+        # Set global seed for this run
+        set_global_seed(current_seed)
+
+        # Create runner for this run
+        runner = BulkTestRunner(config)
+
+        try:
+            if config.use_agentic_retry:
+                # Run agentic RAG with retry loop
+                results_df = runner.run_agentic_test(adapter)
+            else:
+                # Standard RAG (no retry)
+                results_df = runner.run_bulk_test(adapter)
+
+            # Add run metadata
+            results_df['run_id'] = run_idx
+            results_df['seed'] = current_seed
+
+            all_run_results.append(results_df)
+
+            # Save individual run results
+            if num_runs > 1:
+                run_path = runner._save_results(results_df, adapter, partial=False, include_run=True)
+                if run_path:
+                    all_run_paths.append(run_path)
+            else:
+                # Single run: save normally
+                runner.save_results(results_df, adapter)
+
+        except Exception as e:
+            print(f"\nERROR in run {run_idx + 1}: {str(e)}")
+            import traceback
+            traceback.print_exc()
+            if not all_run_results:
+                sys.exit(1)
+            print(f"Continuing with {len(all_run_results)} completed runs...")
+
+    # Aggregate results across runs if multiple runs
+    if num_runs > 1 and len(all_run_results) > 1:
+        print("\n" + "=" * 60)
+        print("AGGREGATING RESULTS ACROSS RUNS")
+        print("=" * 60)
+
+        aggregate_and_save_results(
+            all_run_results=all_run_results,
+            config=config,
+            adapter=adapter,
+            all_run_paths=all_run_paths,
+        )
+
+
+def aggregate_and_save_results(
+    all_run_results: List[pd.DataFrame],
+    config: BulkTestConfig,
+    adapter,
+    all_run_paths: List[Path],
+) -> None:
+    """Aggregate results across multiple runs and save summary.
+
+    Computes mean ± std across runs for all metrics, and saves:
+    1. Combined CSV with all runs
+    2. Aggregated JSON summary with cross-run statistics
+    3. LaTeX-ready table snippet
+    """
+    # Combine all runs
+    combined_df = pd.concat(all_run_results, ignore_index=True)
+
+    # Save combined CSV
+    output_dir = Path(config.output_dir)
+    output_dir.mkdir(exist_ok=True)
+    combined_path = output_dir / f"{config.timestamp}_{adapter.name}_combined_{len(all_run_results)}runs.csv"
+    combined_df.to_csv(combined_path, index=False)
+    print(f"\nCombined results saved to: {combined_path}")
+
+    # Compute per-question aggregates (mean across runs for same question_id)
+    question_col = 'question_id'
+    if question_col not in combined_df.columns:
+        question_col = combined_df.columns[0]  # Fallback to first column
+
+    # Metrics to aggregate
+    metric_cols = ['semantic_similarity', 'judge_score', 'numeric_accuracy']
+    metric_cols = [c for c in metric_cols if c in combined_df.columns]
+
+    # Compute cross-run statistics
+    cross_run_stats = {
+        'num_runs': len(all_run_results),
+        'seeds': [config.seed - config.run_id + i for i in range(len(all_run_results))],
+        'run_files': [str(p) for p in all_run_paths],
+    }
+
+    # Per-run means (for computing std across runs)
+    run_means = {}
+    for col in metric_cols:
+        run_means[col] = []
+        for run_df in all_run_results:
+            if col in run_df.columns:
+                run_means[col].append(float(run_df[col].dropna().mean()))
+
+    # Aggregate statistics
+    for col in metric_cols:
+        if run_means.get(col):
+            means = run_means[col]
+            cross_run_stats[col] = {
+                'mean_across_runs': float(np.mean(means)),
+                'std_across_runs': float(np.std(means)),
+                'per_run_means': means,
+            }
+            # Bootstrap CI on run means
+            if len(means) >= 2:
+                mean, ci_lower, ci_upper = bootstrap_ci(means, n_bootstrap=1000)
+                cross_run_stats[col]['ci_95'] = [ci_lower, ci_upper]
+
+    # Save aggregated summary
+    summary_path = output_dir / f"{config.timestamp}_{adapter.name}_aggregated_{len(all_run_results)}runs.json"
+    summary = {
+        'config': asdict(config),
+        'cross_run_stats': cross_run_stats,
+    }
+    with open(summary_path, 'w') as f:
+        json.dump(summary, f, indent=2)
+    print(f"Aggregated summary saved to: {summary_path}")
+
+    # Print cross-run summary
+    print("\n" + "=" * 60)
+    print("CROSS-RUN SUMMARY")
+    print("=" * 60)
+    for col in metric_cols:
+        if col in cross_run_stats:
+            stats = cross_run_stats[col]
+            mean = stats['mean_across_runs']
+            std = stats['std_across_runs']
+            print(f"\n{col}:")
+            print(f"  Mean ± Std: {mean:.4f} ± {std:.4f}")
+            if 'ci_95' in stats:
+                ci = stats['ci_95']
+                print(f"  95% CI:     [{ci[0]:.4f}, {ci[1]:.4f}]")
+            print(f"  Per-run:    {[f'{m:.4f}' for m in stats['per_run_means']]}")
+    print("\n" + "=" * 60)
+
+    # Generate LaTeX table row
+    print("\n" + "=" * 60)
+    print("LATEX TABLE ROW (copy to paper)")
+    print("=" * 60)
+
+    pipeline_name = config.pipeline_id
+    if config.use_agentic_retry:
+        pipeline_name = f"SC-RAG (B={config.max_retries})"
+
+    row_parts = [pipeline_name]
+    for col in metric_cols:
+        if col in cross_run_stats:
+            stats = cross_run_stats[col]
+            mean = stats['mean_across_runs']
+            std = stats['std_across_runs']
+            row_parts.append(f"{mean:.2f} $\\pm$ {std:.2f}")
         else:
-            # Standard RAG (no retry)
-            results_df = runner.run_bulk_test(adapter)
-            runner.save_results(results_df, adapter)
-    except Exception as e:
-        print(f"\nFATAL ERROR: {str(e)}")
-        import traceback
-        traceback.print_exc()
-        sys.exit(1)
+            row_parts.append("--")
+
+    latex_row = " & ".join(row_parts) + r" \\"
+    print(latex_row)
+    print("=" * 60)
+
+    # Save LaTeX snippet
+    latex_path = output_dir / f"{config.timestamp}_{adapter.name}_latex_row.tex"
+    with open(latex_path, 'w') as f:
+        f.write(f"% Pipeline: {pipeline_name}\n")
+        f.write(f"% Runs: {len(all_run_results)}, Seeds: {cross_run_stats['seeds']}\n")
+        f.write(latex_row + "\n")
+    print(f"LaTeX row saved to: {latex_path}")
+
+    # Update manifest with results
+    manifest["results"] = {
+        "num_runs_completed": len(all_run_results),
+        "cross_run_mean": cross_run_stats.get("mean"),
+        "cross_run_std": cross_run_stats.get("std"),
+    }
+    with open(manifest_path, 'w') as f:
+        json.dump(manifest, f, indent=2)
+    print(f"Manifest updated: {manifest_path}")
 
 
 if __name__ == "__main__":

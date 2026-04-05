@@ -8,11 +8,30 @@ from typing import Any, Dict, List, Optional
 
 from langchain_core.documents import Document
 
+import re as _re
+
 from .base import AgentDecision
 from .retrieval_agent import RetrievalAgent
 from .reasoning_agent import ReasoningAgent
+from .table_agent import TableAgent
 from .judge_agent import JudgeAgent
 from .logger import AgentLogger
+from src.providers.base import get_usage_tracker
+from src.config import calculate_cost
+
+
+def _looks_like_table_content(text: str) -> bool:
+    """Quick heuristic check if text looks like table data."""
+    lines = text.strip().split('\n')
+    if len(lines) < 2:
+        return False
+    # Check for consistent delimiters across lines
+    tab_count = sum(1 for l in lines if '\t' in l)
+    pipe_count = sum(1 for l in lines if '|' in l)
+    multi_space = sum(1 for l in lines if '  ' in l and any(c.isdigit() for c in l))
+    return (tab_count > len(lines) * 0.4 or
+            pipe_count > len(lines) * 0.4 or
+            multi_space > len(lines) * 0.4)
 
 
 @dataclass
@@ -40,6 +59,10 @@ class AgenticRAGConfig:
     temperature: float = 0.0
     max_tokens: int = 512
 
+    # Table reasoning settings (rLLM-FinQA integration)
+    use_table_agent: bool = False  # Enable TableAgent for numeric computation
+    vllm_base_url: str = None  # vLLM server URL for rLLM-FinQA-4B
+
     # Ablation study settings
     # These flags disable specific components to measure their contribution
     ablation_no_retrieval_escalation: bool = False  # Fix top_k=10 on all attempts
@@ -63,6 +86,7 @@ class AgenticRAGResult:
     generation_time_ms: float
     total_time_ms: float
     error: Optional[str] = None
+    cost_usd: float = 0.0
 
 
 class AgenticRAGOrchestrator:
@@ -116,6 +140,14 @@ class AgenticRAGOrchestrator:
             disable_escalation=self.config.ablation_no_prompt_escalation,
         )
 
+        # Initialize TableAgent if enabled (for numeric computation via SQL+calculator)
+        self.table_agent = None
+        if self.config.use_table_agent:
+            self.table_agent = TableAgent(
+                model_name=self.config.llm_model,
+                vllm_base_url=self.config.vllm_base_url,
+            )
+
         self.judge_agent = JudgeAgent(
             judge_model=self.config.judge_model,
             retry_threshold=self.config.retry_threshold,
@@ -133,11 +165,59 @@ class AgenticRAGOrchestrator:
         self.total_retries = 0
         self.successful_retries = 0
 
+        # Cost tracking
+        self.total_prompt_tokens = 0
+        self.total_completion_tokens = 0
+        self.total_cost_usd = 0.0
+
     def reset_agents(self) -> None:
         """Reset all agents for a new question."""
         self.retrieval_agent.reset()
         self.reasoning_agent.reset()
+        if self.table_agent:
+            self.table_agent.reset()
         self.judge_agent.reset()
+
+    @staticmethod
+    def _needs_table_reasoning(question: str, docs: list) -> bool:
+        """Determine if a question should be routed to the TableAgent.
+
+        Routes to TableAgent when:
+        1. Question asks for numeric computation (growth rate, ratio, margin, etc.)
+        2. Retrieved documents contain table-like content
+
+        Args:
+            question: The question text
+            docs: Retrieved documents
+
+        Returns:
+            True if TableAgent should handle this question
+        """
+        import re
+
+        q_lower = question.lower()
+
+        # Check for computation-requiring patterns
+        computation_patterns = [
+            r'\b(growth rate|year.over.year|yoy|change|increase|decrease)\b',
+            r'\b(ratio|margin|percentage|percent change)\b',
+            r'\b(calculate|compute|derive|what is the .+ of)\b',
+            r'\b(compare|difference between|how much .+ change)\b',
+            r'\b(total|sum|average|weighted)\b.*\b(of|for)\b',
+        ]
+        needs_computation = any(re.search(p, q_lower) for p in computation_patterns)
+
+        if not needs_computation:
+            return False
+
+        # Check if retrieved docs contain table content
+        has_tables = any(
+            doc.metadata.get("element_type") == "table"
+            or _looks_like_table_content(doc.page_content)
+            for doc in docs[:5]  # Check top 5 docs only
+        )
+
+        return has_tables
 
     def process_question(
         self,
@@ -156,6 +236,10 @@ class AgenticRAGOrchestrator:
             AgenticRAGResult with answer and decision log
         """
         start_time = time.time()
+
+        # Snapshot token counts before this question for cost calculation
+        tracker = get_usage_tracker()
+        tokens_before = tracker.total_prompt_tokens + tracker.total_completion_tokens
 
         # Generate question ID if not provided
         if question_id is None:
@@ -208,28 +292,60 @@ class AgenticRAGOrchestrator:
                     error = "No documents retrieved"
                     break
 
-                # === Agent B: Reasoning ===
+                # === Agent B: Reasoning (with optional Table Agent routing) ===
                 generation_start = time.time()
 
-                reasoning_decision = self.reasoning_agent.decide({
-                    "question": question,
-                    "documents": docs,
-                    "attempt": attempt,
-                })
+                # Document Triage: route to TableAgent for numeric computation
+                use_table = (
+                    self.table_agent is not None
+                    and self._needs_table_reasoning(question, docs)
+                )
+
+                if use_table:
+                    # Route to TableAgent for SQL + calculator computation
+                    reasoning_decision = self.table_agent.decide({
+                        "question": question,
+                        "documents": docs,
+                        "attempt": attempt,
+                    })
+                    agent_used = "table_agent"
+                else:
+                    # Standard ReasoningAgent for narrative questions
+                    reasoning_decision = self.reasoning_agent.decide({
+                        "question": question,
+                        "documents": docs,
+                        "attempt": attempt,
+                    })
+                    agent_used = "reasoning_agent"
 
                 generation_time_ms += (time.time() - generation_start) * 1000
 
                 if self.logger:
-                    self.logger.log_decision("reasoning_agent", reasoning_decision)
+                    self.logger.log_decision(agent_used, reasoning_decision)
 
                 answer = reasoning_decision.decision_value.get("answer")
 
                 if not answer:
                     error = reasoning_decision.decision_value.get("error", "No answer generated")
-                    break
+                    # If TableAgent failed, fall back to ReasoningAgent
+                    if use_table:
+                        reasoning_decision = self.reasoning_agent.decide({
+                            "question": question,
+                            "documents": docs,
+                            "attempt": attempt,
+                        })
+                        answer = reasoning_decision.decision_value.get("answer")
+                        if self.logger:
+                            self.logger.log_decision("reasoning_agent", reasoning_decision)
+                        if not answer:
+                            break
+                        error = None  # Clear error since fallback succeeded
+                    else:
+                        break
 
                 # === Agent C: Judge ===
-                # In blind mode, Judge uses self-evaluation without gold answer
+                # In blind mode, Judge uses self-evaluation without gold answer.
+                # Documents are passed for blind numeric grounding verification.
                 judge_gold = None if self.config.blind_judge else gold_answer
                 judge_decision = self.judge_agent.decide({
                     "question": question,
@@ -237,6 +353,7 @@ class AgenticRAGOrchestrator:
                     "gold_answer": judge_gold,
                     "attempt": attempt,
                     "max_retries": self.config.max_retries,
+                    "documents": docs,
                 })
 
                 if self.logger:
@@ -296,6 +413,19 @@ class AgenticRAGOrchestrator:
 
         total_time_ms = (time.time() - start_time) * 1000
 
+        # Calculate cost for this question from token delta
+        tokens_after = tracker.total_prompt_tokens + tracker.total_completion_tokens
+        question_tokens = tokens_after - tokens_before
+        # Estimate cost using the generation model (most calls use this)
+        model_for_cost = self.config.llm_model or "gpt-4o-mini"
+        question_cost = calculate_cost(model_for_cost, {
+            "prompt_tokens": tracker.total_prompt_tokens - (tokens_before - tracker.total_completion_tokens) if tokens_before > tracker.total_completion_tokens else question_tokens * 0.8,
+            "completion_tokens": question_tokens * 0.2,
+        }) if question_tokens > 0 else 0.0
+        self.total_cost_usd += question_cost
+        self.total_prompt_tokens = tracker.total_prompt_tokens
+        self.total_completion_tokens = tracker.total_completion_tokens
+
         # Finish logging
         if self.logger:
             self.logger.finish_question(final_answer, correct, improvement_from_retry)
@@ -313,6 +443,7 @@ class AgenticRAGOrchestrator:
             generation_time_ms=generation_time_ms,
             total_time_ms=total_time_ms,
             error=error,
+            cost_usd=question_cost,
         )
 
     def process_batch(
@@ -381,6 +512,10 @@ class AgenticRAGOrchestrator:
             "successful_retries": self.successful_retries,
             "retry_rate": self.total_retries / max(1, self.total_questions),
             "retry_success_rate": self.successful_retries / max(1, self.total_retries),
+            "total_prompt_tokens": self.total_prompt_tokens,
+            "total_completion_tokens": self.total_completion_tokens,
+            "total_cost_usd": self.total_cost_usd,
+            "avg_cost_per_question": self.total_cost_usd / max(1, self.total_questions),
         }
 
         if self.logger:

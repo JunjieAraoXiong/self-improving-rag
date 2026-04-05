@@ -14,6 +14,42 @@ class LLMResponse:
     usage: Optional[dict] = None
 
 
+class UsageTracker:
+    """Global token/cost accumulator across all provider calls."""
+
+    def __init__(self):
+        self.total_prompt_tokens = 0
+        self.total_completion_tokens = 0
+        self.total_calls = 0
+
+    def record(self, usage: Optional[dict]):
+        if usage:
+            self.total_prompt_tokens += usage.get("prompt_tokens", 0) or 0
+            self.total_completion_tokens += usage.get("completion_tokens", 0) or 0
+            self.total_calls += 1
+
+    def reset(self):
+        self.total_prompt_tokens = 0
+        self.total_completion_tokens = 0
+        self.total_calls = 0
+
+    def summary(self) -> dict:
+        return {
+            "total_prompt_tokens": self.total_prompt_tokens,
+            "total_completion_tokens": self.total_completion_tokens,
+            "total_calls": self.total_calls,
+        }
+
+
+# Global usage tracker -- all providers record here
+_usage_tracker = UsageTracker()
+
+
+def get_usage_tracker() -> UsageTracker:
+    """Get the global usage tracker."""
+    return _usage_tracker
+
+
 class LLMProvider(ABC):
     """Abstract base class for LLM providers."""
 

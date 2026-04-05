@@ -53,12 +53,18 @@ class GoogleProvider(LLMProvider):
                 "total_tokens": response.usage_metadata.total_token_count,
             }
 
-        return LLMResponse(
+        response_obj = LLMResponse(
             content=content,
             model=self.model_name,
             provider="google",
             usage=usage,
         )
+
+        # Record usage in global tracker
+        from .base import get_usage_tracker
+        get_usage_tracker().record(usage)
+
+        return response_obj
 
     @property
     def provider_name(self) -> str:
