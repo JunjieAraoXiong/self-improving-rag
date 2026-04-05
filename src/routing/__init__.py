@@ -1,4 +1,4 @@
-"""Meta-learning components for adaptive RAG pipeline selection."""
+"""Rule-based routing for retrieval pipeline selection."""
 
 from .features import extract_features, FeatureExtractor
 from .router import Router, RuleBasedRouter, get_router

@@ -253,6 +253,7 @@ class BulkTestRunner:
         try:
             # Retrieval phase
             retrieval_start = time.time()
+            docs = []  # Initialize so verify_numeric_answer has a fallback
 
             # Use RSE for segment-level retrieval if enabled
             if self.config.use_rse and self.pipeline and hasattr(self.pipeline, 'retrieve_segments'):
@@ -334,9 +335,10 @@ Plan and Answer:"""
                 result['predicted_answer'] = response.content
 
                 # Numeric verification - check if numbers in answer exist in sources
-                verification = verify_numeric_answer(response.content, docs)
-                result['numeric_score'] = verification.score
-                result['flagged_numbers'] = verification.flagged_numbers
+                if docs:
+                    verification = verify_numeric_answer(response.content, docs)
+                    result['numeric_score'] = verification.score
+                    result['flagged_numbers'] = verification.flagged_numbers
             else:
                 result['error'] = "Empty response from LLM"
 
@@ -735,11 +737,6 @@ def main():
         help='Path to subset questions CSV'
     )
     parser.add_argument(
-        '--split', type=str, default='dev',
-        choices=['train', 'dev', 'test', 'validation'],
-        help='Dataset split to use (for FinQA and similar HuggingFace datasets). Default: dev'
-    )
-    parser.add_argument(
         '--use-llm-judge', action='store_true',
         help='Enable LLM-as-a-Judge evaluation'
     )
@@ -855,6 +852,7 @@ def main():
         retry_threshold=args.retry_threshold,
         agent_log_dir=args.agent_log_dir,
         blind_judge=args.blind_judge,
+        use_numeric_verify=args.use_numeric_verify,
         # Ablation settings
         ablation=args.ablation,
         # Reproducibility settings
