@@ -34,6 +34,9 @@ results/
 oracle_labels/
 models/
 
+# External repos (submodule or local clone)
+rllm/
+
 # Testing
 .pytest_cache/
 .coverage

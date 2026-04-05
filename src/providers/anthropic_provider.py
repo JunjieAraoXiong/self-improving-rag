@@ -17,6 +17,13 @@ class AnthropicProvider(LLMProvider):
         max_tokens: int = 512,
         temperature: float = 0.0,
     ) -> LLMResponse:
+        # Check cache first
+        from .cache import get_cache
+        cache = get_cache()
+        cached = cache.get(self.model_name, system_prompt, user_prompt, temperature, max_tokens)
+        if cached is not None:
+            return cached
+
         response = self.client.messages.create(
             model=self.model_name,
             max_tokens=max_tokens,
@@ -46,6 +53,9 @@ class AnthropicProvider(LLMProvider):
         # Record usage in global tracker
         from .base import get_usage_tracker
         get_usage_tracker().record(usage)
+
+        # Store in cache
+        cache.put(self.model_name, system_prompt, user_prompt, temperature, max_tokens, response_obj)
 
         return response_obj
 

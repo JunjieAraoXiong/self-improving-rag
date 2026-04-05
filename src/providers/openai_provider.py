@@ -32,6 +32,13 @@ class OpenAIProvider(LLMProvider):
         max_tokens: int = 512,
         temperature: float = 0.0,
     ) -> LLMResponse:
+        # Check cache first (only for deterministic calls)
+        from .cache import get_cache
+        cache = get_cache()
+        cached = cache.get(self.model_name, system_prompt, user_prompt, temperature, max_tokens)
+        if cached is not None:
+            return cached
+
         # GPT-5.x models require max_completion_tokens instead of max_tokens
         use_new_param = self.model_name.startswith("gpt-5") or "o1" in self.model_name or "o3" in self.model_name
 
@@ -73,6 +80,9 @@ class OpenAIProvider(LLMProvider):
         # Record usage in global tracker
         from .base import get_usage_tracker
         get_usage_tracker().record(usage)
+
+        # Store in cache
+        cache.put(self.model_name, system_prompt, user_prompt, temperature, max_tokens, response_obj)
 
         return response_obj
 

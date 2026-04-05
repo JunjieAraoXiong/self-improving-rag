@@ -121,6 +121,10 @@ class BulkTestConfig:
     agent_log_dir: str = "agent_logs"  # Directory for agent decision logs
     blind_judge: bool = False  # If True, Judge uses self-evaluation (no gold answer)
 
+    # Table reasoning settings (rLLM-FinQA integration)
+    use_table_agent: bool = False  # Route numeric computation to TableAgent
+    vllm_base_url: str = None  # vLLM server URL for rLLM-FinQA-4B model
+
     # Ablation study settings
     ablation: str = None  # Ablation mode to run
     ablation_no_retrieval_escalation: bool = False
@@ -564,6 +568,9 @@ Plan and Answer:"""
             enable_logging=True,
             temperature=self.config.temperature,
             max_tokens=self.config.max_tokens,
+            # Table reasoning settings
+            use_table_agent=self.config.use_table_agent,
+            vllm_base_url=self.config.vllm_base_url,
             # Ablation study settings
             ablation_no_retrieval_escalation=self.config.ablation_no_retrieval_escalation,
             ablation_no_prompt_escalation=self.config.ablation_no_prompt_escalation,
@@ -805,6 +812,16 @@ def main():
         help='Use blind judge mode: Judge evaluates without seeing gold answer (for realistic TPR/FPR)'
     )
 
+    # Table reasoning (rLLM-FinQA) arguments
+    parser.add_argument(
+        '--use-table-agent', action='store_true',
+        help='Enable TableAgent for numeric computation questions (requires rLLM install)'
+    )
+    parser.add_argument(
+        '--vllm-base-url', type=str, default=None,
+        help='vLLM server URL for rLLM-FinQA-4B model (e.g. http://localhost:30000/v1)'
+    )
+
     # Ablation study arguments
     parser.add_argument(
         '--ablation', type=str, default=None,
@@ -855,6 +872,9 @@ def main():
         retry_threshold=args.retry_threshold,
         agent_log_dir=args.agent_log_dir,
         blind_judge=args.blind_judge,
+        # Table reasoning settings
+        use_table_agent=args.use_table_agent,
+        vllm_base_url=args.vllm_base_url,
         # Ablation settings
         ablation=args.ablation,
         # Reproducibility settings
@@ -923,9 +943,38 @@ def main():
     print(f"  Num runs:   {num_runs}")
     if config.use_agentic_retry:
         print(f"  Mode:       Agentic RAG (max_retries={config.max_retries})")
+        if config.use_table_agent:
+            print(f"  TableAgent: ON (vllm={config.vllm_base_url or 'LLM fallback'})")
     else:
         print(f"  Mode:       Standard RAG")
     print("=" * 60)
+
+    # Write experiment manifest for reproducibility
+    manifest_dir = Path(config.output_dir)
+    manifest_dir.mkdir(parents=True, exist_ok=True)
+    manifest = {
+        "timestamp": config.timestamp,
+        "dataset": args.dataset,
+        "pipeline": config.pipeline_id,
+        "model": config.model_name,
+        "judge_model": config.judge_model,
+        "seed": base_seed,
+        "num_runs": num_runs,
+        "use_agentic_retry": config.use_agentic_retry,
+        "max_retries": config.max_retries,
+        "use_table_agent": config.use_table_agent,
+        "vllm_base_url": config.vllm_base_url,
+        "blind_judge": config.blind_judge,
+        "top_k": config.top_k_retrieval,
+        "temperature": config.temperature,
+        "embedding_model": config.embedding_model,
+        "reranker_model": config.reranker_model,
+        "ablation": config.ablation,
+    }
+    manifest_path = manifest_dir / f"manifest_{config.timestamp}.json"
+    with open(manifest_path, 'w') as f:
+        json.dump(manifest, f, indent=2)
+    print(f"  Manifest:   {manifest_path}")
 
     for run_idx in range(num_runs):
         current_seed = base_seed + run_idx
@@ -1105,6 +1154,16 @@ def aggregate_and_save_results(
         f.write(f"% Runs: {len(all_run_results)}, Seeds: {cross_run_stats['seeds']}\n")
         f.write(latex_row + "\n")
     print(f"LaTeX row saved to: {latex_path}")
+
+    # Update manifest with results
+    manifest["results"] = {
+        "num_runs_completed": len(all_run_results),
+        "cross_run_mean": cross_run_stats.get("mean"),
+        "cross_run_std": cross_run_stats.get("std"),
+    }
+    with open(manifest_path, 'w') as f:
+        json.dump(manifest, f, indent=2)
+    print(f"Manifest updated: {manifest_path}")
 
 
 if __name__ == "__main__":
