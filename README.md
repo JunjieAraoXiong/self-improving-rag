@@ -49,27 +49,69 @@ The Orchestrator runs a retry loop (budget $B{=}2$, up to 3 attempts):
 
 Best answer is always kept -- retry never degrades output quality.
 
+## rLLM-FinQA Integration
+
+We integrate [rLLM-FinQA](https://rllm-project.com/post.html?post=finqa.md) (Roongta, Tan et al., UC Berkeley / Snorkel AI) for RL-trained financial table reasoning. This adds a **TableAgent** with SQL + calculator tools that handles the 66% of FinanceBench questions requiring numeric computation.
+
+| Component | Source | What it does |
+|-----------|--------|-------------|
+| Document retrieval + self-correction | Self-Improving RAG | Finds documents, verifies answers, retries on failure |
+| Table reasoning + tool use | rLLM-FinQA | SQL queries, calculator, schema discovery over SEC tables |
+| Combined pipeline | **New** | Retrieve documents, triage (table vs narrative), compute, verify |
+
+### Setup rLLM-FinQA
+
+```bash
+git clone https://github.com/rllm-org/rllm.git   # in repo root
+pip install -e rllm && pip install asteval
+python -m projects.finqa.prepare_finqa_data        # downloads 207 companies, 6,900 tables
+```
+
+### Training with rLLM (Optional)
+
+The existing [rLLM-FinQA-4B model](https://huggingface.co/rLLM/rLLM-FinQA-4B) can be used directly via vLLM. If you want to train on expanded data:
+
+| Option | What | Cost | When |
+|--------|------|------|------|
+| **A. Use pre-trained model** | Serve rLLM-FinQA-4B via vLLM, use as-is | $0 | Start here |
+| **B. Expand table data** | Run rLLM's synthetic data pipeline on FinanceBench companies | ~$50 | If company coverage is insufficient |
+| **C. Fine-tune new model** | Use rLLM's GRPO framework on expanded data (8xH100, 21hrs) | ~$500 | For best accuracy / paper contribution |
+
+```bash
+# Option A: Inference only (requires GPU)
+python -m vllm.entrypoints.openai.api_server \
+    --model rLLM/rLLM-FinQA-4B --port 30000 --dtype bfloat16
+
+# Option C: Training (requires 8xH100)
+cd rllm && bash projects/finqa/train_finqa.sh
+```
+
 ## Project Structure
 
 ```
 ├── src/
 │   ├── agents/              # Multi-agent system (Algorithm 1)
-│   │   ├── orchestrator.py  # Main retry loop
+│   │   ├── orchestrator.py  # Main retry loop + document triage
 │   │   ├── retrieval_agent.py
 │   │   ├── reasoning_agent.py
-│   │   └── judge_agent.py
+│   │   ├── table_agent.py   # Bridge to rLLM-FinQA tools
+│   │   └── judge_agent.py   # Blind numeric verification
 │   ├── retrieval_tools/     # Retrieval pipelines
 │   │   ├── semantic.py      # Dense vector search
 │   │   ├── hybrid.py        # BM25 + semantic ensemble
 │   │   ├── rerank.py        # Cross-encoder reranking
 │   │   ├── hyde.py          # Hypothetical Document Embeddings
 │   │   └── router.py        # Rule-based routing
-│   ├── providers/           # LLM adapters (OpenAI, Anthropic)
-│   ├── config.py            # Central configuration
+│   ├── providers/           # LLM adapters (OpenAI, Anthropic, Google)
+│   │   └── cache.py         # SQLite LLM response cache
+│   ├── config.py            # Configuration + cost tracking
 │   └── bulk_testing.py      # Evaluation entry point
 ├── evaluation/              # Metrics & LLM-as-Judge
-├── dataset_adapters/        # FinanceBench loader
-└── scripts/                 # Experiment scripts
+├── dataset_adapters/        # FinanceBench, FinQA loaders
+├── scripts/
+│   └── eval_finqa.py        # FinQA benchmark evaluation
+└── rllm/                    # rLLM submodule (clone separately)
+    └── projects/finqa/      # 4 tools, agent, environment, training
 ```
 
 ## Quick Start
@@ -102,6 +144,48 @@ python src/bulk_testing.py \
     --max-retries 2
 ```
 
+### Run with Table Agent (rLLM-FinQA Integration)
+```bash
+# With GPT-4o-mini driving rLLM tools (no GPU needed)
+python src/bulk_testing.py \
+    --dataset financebench \
+    --pipeline hybrid_filter_rerank \
+    --model gpt-4o-mini \
+    --use-llm-judge \
+    --use-agentic-retry \
+    --use-table-agent
+
+# With rLLM-FinQA-4B model (requires vLLM server on GPU)
+python src/bulk_testing.py \
+    --dataset financebench \
+    --use-agentic-retry \
+    --use-table-agent \
+    --vllm-base-url http://localhost:30000/v1
+```
+
+### Run FinQA Benchmark
+```bash
+# Quick test (50 questions)
+python scripts/eval_finqa.py --model gpt-4o-mini --n 50
+
+# Full benchmark (558 questions)
+python scripts/eval_finqa.py --model gpt-4o-mini --n 558
+
+# With rLLM-FinQA-4B model
+python scripts/eval_finqa.py --vllm-base-url http://localhost:30000/v1 --n 558
+```
+
+### Cross-Model Judging
+```bash
+# Generate with GPT-4o-mini, judge with GPT-4o
+python src/bulk_testing.py \
+    --dataset financebench \
+    --model gpt-4o-mini \
+    --judge-model gpt-4o \
+    --use-llm-judge \
+    --use-agentic-retry
+```
+
 ## Reproducing Results
 
 ### Step 1: Prepare ChromaDB
@@ -114,11 +198,17 @@ python src/ingest_docling.py --input-dir data/pdfs --output-dir chroma_docling
 ```bash
 # Table 1: Single-pass vs Self-Improving RAG (oracle-guided)
 python src/bulk_testing.py --dataset financebench --pipeline hybrid_filter_rerank --model gpt-4o-mini --use-llm-judge
-python src/bulk_testing.py --dataset financebench --pipeline routed --model gpt-4o-mini --use-llm-judge --use-agentic-retry --max-retries 2
+python src/bulk_testing.py --dataset financebench --pipeline hybrid_filter_rerank --model gpt-4o-mini --use-llm-judge --use-agentic-retry --max-retries 2
+
+# Table 2: With Table Agent (rLLM-FinQA integration)
+python src/bulk_testing.py --dataset financebench --pipeline hybrid_filter_rerank --model gpt-4o-mini --use-llm-judge --use-agentic-retry --use-table-agent
 
 # Table 3: Component ablation (deployment mode)
-python src/bulk_testing.py --dataset financebench --pipeline routed --model gpt-4o-mini --use-agentic-retry --max-retries 2
-python src/bulk_testing.py --dataset financebench --pipeline routed --model gpt-4o-mini --use-agentic-retry --max-retries 1
+python src/bulk_testing.py --dataset financebench --model gpt-4o-mini --use-agentic-retry --blind-judge --max-retries 2
+python src/bulk_testing.py --dataset financebench --model gpt-4o-mini --use-agentic-retry --blind-judge --max-retries 1
+
+# Table 4: FinQA benchmark
+python scripts/eval_finqa.py --model gpt-4o-mini --n 558
 ```
 
 ## Citation
