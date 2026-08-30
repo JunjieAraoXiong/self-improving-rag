@@ -1,6 +1,6 @@
 """Factory for creating LLM providers."""
 
-from typing import Dict, Optional
+from typing import Dict
 from .base import LLMProvider
 from .openai_provider import OpenAIProvider
 from .anthropic_provider import AnthropicProvider
@@ -10,7 +10,7 @@ from .google_provider import GoogleProvider
 import sys
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
-from config import get_provider_config, get_provider_for_model
+from config import get_provider_config
 
 
 # Cache providers to avoid recreating clients

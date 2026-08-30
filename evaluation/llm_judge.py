@@ -2,13 +2,18 @@
 
 import sys
 from pathlib import Path
-from typing import Tuple, Optional
+from typing import Tuple
+import math
 import re
 
 # Add parent directory to path for imports
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from src.providers import get_provider
+
+
+class JudgeEvaluationError(RuntimeError):
+    """The external outcome/policy evaluator failed to produce a score."""
 
 
 JUDGE_SYSTEM_PROMPT = """You are an expert evaluator for question-answering systems. Your task is to judge whether a predicted answer is correct compared to a gold/reference answer.
@@ -40,7 +45,7 @@ Evaluate the predicted answer against the gold answer and provide your score and
 
 
 def parse_judge_response(response: str) -> Tuple[float, str]:
-    """Parse the judge response to extract score and justification.
+    """Strictly parse one score and one non-empty justification.
 
     Args:
         response: Raw response from the judge LLM
@@ -48,39 +53,35 @@ def parse_judge_response(response: str) -> Tuple[float, str]:
     Returns:
         Tuple of (score, justification)
     """
-    score = 0.0
-    justification = response
+    if not isinstance(response, str):
+        raise JudgeEvaluationError("Judge response must be text")
+    score_matches = re.findall(
+        r"(?im)^\s*SCORE:\s*([^\r\n]+?)\s*$",
+        response,
+    )
+    if len(score_matches) != 1:
+        raise JudgeEvaluationError(
+            f"Expected exactly one SCORE field, found {len(score_matches)}"
+        )
+    raw_score = score_matches[0].strip()
+    if not re.fullmatch(r"(?:0(?:\.\d+)?|1(?:\.0+)?)", raw_score):
+        raise JudgeEvaluationError("SCORE must be a finite number in [0, 1]")
+    score = float(raw_score)
+    if not math.isfinite(score) or not 0.0 <= score <= 1.0:
+        raise JudgeEvaluationError("SCORE must be a finite number in [0, 1]")
 
-    # Try to extract score
-    score_patterns = [
-        r"SCORE:\s*([0-9.]+)",
-        r"Score:\s*([0-9.]+)",
-        r"score:\s*([0-9.]+)",
-    ]
-
-    for pattern in score_patterns:
-        match = re.search(pattern, response)
-        if match:
-            try:
-                score = float(match.group(1))
-                score = max(0.0, min(1.0, score))  # Clamp to [0, 1]
-                break
-            except ValueError:
-                continue
-
-    # Try to extract justification
-    justification_patterns = [
-        r"JUSTIFICATION:\s*(.+?)(?:\n|$)",
-        r"Justification:\s*(.+?)(?:\n|$)",
-        r"justification:\s*(.+?)(?:\n|$)",
-    ]
-
-    for pattern in justification_patterns:
-        match = re.search(pattern, response, re.DOTALL)
-        if match:
-            justification = match.group(1).strip()
-            break
-
+    justification_markers = list(
+        re.finditer(r"(?im)^\s*JUSTIFICATION:\s*", response)
+    )
+    if len(justification_markers) != 1:
+        raise JudgeEvaluationError(
+            "Expected exactly one JUSTIFICATION field"
+        )
+    justification = response[justification_markers[0].end() :].strip()
+    if not justification:
+        raise JudgeEvaluationError("JUSTIFICATION must be non-empty")
+    if re.search(r"(?im)^\s*(?:SCORE|JUSTIFICATION):", justification):
+        raise JudgeEvaluationError("Judge response contains duplicate fields")
     return score, justification
 
 
@@ -129,9 +130,7 @@ def llm_as_judge(
         return score, justification
 
     except Exception as e:
-        error_msg = f"Judge error: {str(e)}"
-        print(f"Warning: {error_msg}")
-        return 0.0, error_msg
+        raise JudgeEvaluationError(f"Judge evaluation failed: {e}") from e
 
 
 def llm_as_judge_batch(

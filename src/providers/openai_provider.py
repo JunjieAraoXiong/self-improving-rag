@@ -3,11 +3,13 @@
 from typing import Optional
 import openai
 
-from .base import LLMProvider, LLMResponse
+from .base import LLMProvider, LLMResponse, package_version
 
 
 class OpenAIProvider(LLMProvider):
     """Provider for OpenAI and OpenAI-compatible APIs."""
+
+    _SEED_CAPABLE_PROVIDERS = frozenset({"openai", "together", "local-vllm"})
 
     def __init__(
         self,
@@ -31,6 +33,7 @@ class OpenAIProvider(LLMProvider):
         user_prompt: str,
         max_tokens: int = 512,
         temperature: float = 0.0,
+        seed: Optional[int] = None,
     ) -> LLMResponse:
         # GPT-5.x models require max_completion_tokens instead of max_tokens
         use_new_param = self.model_name.startswith("gpt-5") or "o1" in self.model_name or "o3" in self.model_name
@@ -48,6 +51,9 @@ class OpenAIProvider(LLMProvider):
             kwargs["max_completion_tokens"] = max_tokens
         else:
             kwargs["max_tokens"] = max_tokens
+        seed_applied = seed is not None and self.supports_seed
+        if seed_applied:
+            kwargs["seed"] = seed
 
         response = self.client.chat.completions.create(**kwargs)
 
@@ -63,19 +69,45 @@ class OpenAIProvider(LLMProvider):
                 "total_tokens": response.usage.total_tokens,
             }
 
+        metadata = self.request_metadata(
+            temperature=temperature,
+            max_tokens=max_tokens,
+            seed=seed,
+            seed_applied=seed_applied,
+            response_model=getattr(response, "model", None),
+            request_id=(
+                getattr(response, "_request_id", None)
+                or getattr(response, "id", None)
+            ),
+            system_fingerprint=getattr(response, "system_fingerprint", None),
+            sdk="openai",
+            sdk_version=package_version("openai"),
+        )
         response_obj = LLMResponse(
             content=content,
             model=self.model_name,
             provider=self._provider_name,
             usage=usage,
+            metadata=metadata,
         )
 
         # Record usage in global tracker
         from .base import get_usage_tracker
-        get_usage_tracker().record(usage)
+        get_usage_tracker().record(
+            usage,
+            model=self.model_name,
+            provider=self._provider_name,
+            request_metadata=metadata,
+        )
 
         return response_obj
 
     @property
     def provider_name(self) -> str:
         return self._provider_name
+
+    @property
+    def supports_seed(self) -> bool:
+        """Use request seeds only for compatibility targets known to accept them."""
+
+        return self._provider_name in self._SEED_CAPABLE_PROVIDERS

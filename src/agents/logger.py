@@ -1,10 +1,9 @@
 """Centralized logging for all agent decisions."""
 
 import json
-from dataclasses import asdict
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Optional
 
 import pandas as pd
 
@@ -55,7 +54,23 @@ class AgentLogger:
             "attempts": [],
             "final_answer": None,
             "correct": None,
+            "policy_accepted": None,
+            "evaluation_mode": None,
+            "evidence_manifest": {},
+            "query_plan": {},
+            "finance_question_spec": {},
+            "finance_program": None,
+            "finance_verification": None,
+            "correction_history": [],
             "improvement_from_retry": None,
+            "abstained": False,
+            "error": None,
+            "terminal_state": None,
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+            "llm_calls": 0,
+            "usage_by_model": {},
+            "estimated_cost_usd": 0.0,
         }
 
     def start_attempt(self, attempt: int) -> None:
@@ -72,7 +87,47 @@ class AgentLogger:
             "retrieval_agent": None,
             "reasoning_agent": None,
             "judge_agent": None,
+            "evidence_manifest": {},
+            "correction_plan": None,
         })
+
+    def log_query_plan(self, query_plan: Dict[str, Any]) -> None:
+        """Persist the compiled finance-query contract for the question."""
+
+        if self._current_question_id is None:
+            raise ValueError("No question started. Call start_question() first.")
+        self.questions[self._current_question_id]["query_plan"] = query_plan
+
+    def log_finance_question_spec(self, spec: Dict[str, Any]) -> None:
+        """Persist the trusted pre-generation calculation contract."""
+
+        if self._current_question_id is None:
+            raise ValueError("No question started. Call start_question() first.")
+        self.questions[self._current_question_id]["finance_question_spec"] = spec
+
+    def log_correction_plan(self, correction_plan: Dict[str, Any]) -> None:
+        """Persist one gap-specific controller action."""
+
+        if self._current_question_id is None:
+            raise ValueError("No question started. Call start_question() first.")
+        question_log = self.questions[self._current_question_id]
+        if not question_log["attempts"]:
+            raise ValueError("No attempt started. Call start_attempt() first.")
+        question_log["attempts"][-1]["correction_plan"] = correction_plan
+        question_log["correction_history"].append(correction_plan)
+
+    def log_evidence_manifest(
+        self,
+        evidence_manifest: Dict[str, Dict[str, Any]],
+    ) -> None:
+        """Persist the positional evidence mapping for the current attempt."""
+
+        if self._current_question_id is None:
+            raise ValueError("No question started. Call start_question() first.")
+        question_log = self.questions[self._current_question_id]
+        if not question_log["attempts"]:
+            raise ValueError("No attempt started. Call start_attempt() first.")
+        question_log["attempts"][-1]["evidence_manifest"] = evidence_manifest
 
     def log_decision(self, agent_name: str, decision: AgentDecision) -> None:
         """Log a decision from an agent.
@@ -94,16 +149,32 @@ class AgentLogger:
 
     def finish_question(
         self,
-        final_answer: str,
-        correct: bool,
-        improvement_from_retry: bool = None
+        final_answer: Optional[str],
+        correct: Optional[bool],
+        improvement_from_retry: bool = None,
+        policy_accepted: Optional[bool] = None,
+        evaluation_mode: Optional[str] = None,
+        evidence_manifest: Optional[Dict[str, Dict[str, Any]]] = None,
+        finance_question_spec: Optional[Dict[str, Any]] = None,
+        finance_program: Optional[Dict[str, Any]] = None,
+        finance_verification: Optional[Dict[str, Any]] = None,
+        error: Optional[str] = None,
+        abstained: bool = False,
+        prompt_tokens: int = 0,
+        completion_tokens: int = 0,
+        llm_calls: int = 0,
+        usage_by_model: Optional[Dict[str, Dict[str, Any]]] = None,
+        estimated_cost_usd: float = 0.0,
     ) -> None:
         """Finish logging for the current question.
 
         Args:
             final_answer: The final answer after all attempts
-            correct: Whether the final answer is correct
+            correct: Oracle/independent correctness, or None when not evaluated
             improvement_from_retry: Whether retry improved the answer
+            policy_accepted: Whether the policy judge accepted the final answer
+            evaluation_mode: ``oracle_guided`` or ``blind_policy``
+            evidence_manifest: Doc-label mapping for the returned final answer
         """
         if self._current_question_id is None:
             raise ValueError("No question started.")
@@ -111,7 +182,28 @@ class AgentLogger:
         question_log = self.questions[self._current_question_id]
         question_log["final_answer"] = final_answer
         question_log["correct"] = correct
+        question_log["policy_accepted"] = policy_accepted
+        question_log["evaluation_mode"] = evaluation_mode
+        question_log["evidence_manifest"] = evidence_manifest or {}
+        question_log["finance_question_spec"] = finance_question_spec or {}
+        question_log["finance_program"] = finance_program
+        question_log["finance_verification"] = finance_verification
         question_log["improvement_from_retry"] = improvement_from_retry
+        question_log["abstained"] = bool(abstained)
+        question_log["error"] = error
+        question_log["prompt_tokens"] = int(prompt_tokens)
+        question_log["completion_tokens"] = int(completion_tokens)
+        question_log["llm_calls"] = int(llm_calls)
+        question_log["usage_by_model"] = usage_by_model or {}
+        question_log["estimated_cost_usd"] = float(estimated_cost_usd)
+        if error:
+            question_log["terminal_state"] = "error"
+        elif abstained:
+            question_log["terminal_state"] = "abstained"
+        elif policy_accepted:
+            question_log["terminal_state"] = "accepted"
+        else:
+            question_log["terminal_state"] = "not_accepted"
 
         self._current_question_id = None
 
@@ -160,6 +252,44 @@ class AgentLogger:
                     "attempt": attempt["attempt"],
                     "final_answer": question_log["final_answer"][:200] if question_log["final_answer"] else None,
                     "correct": question_log["correct"],
+                    "policy_accepted": question_log.get("policy_accepted"),
+                    "evaluation_mode": question_log.get("evaluation_mode"),
+                    "abstained": question_log.get("abstained", False),
+                    "error": question_log.get("error"),
+                    "terminal_state": question_log.get("terminal_state"),
+                    "prompt_tokens": question_log.get("prompt_tokens", 0),
+                    "completion_tokens": question_log.get("completion_tokens", 0),
+                    "llm_calls": question_log.get("llm_calls", 0),
+                    "usage_by_model": json.dumps(
+                        question_log.get("usage_by_model", {}), sort_keys=True
+                    ),
+                    "estimated_cost_usd": question_log.get(
+                        "estimated_cost_usd", 0.0
+                    ),
+                    "query_plan": json.dumps(
+                        question_log.get("query_plan", {}), sort_keys=True
+                    ),
+                    "finance_question_spec": json.dumps(
+                        question_log.get("finance_question_spec", {}), sort_keys=True
+                    ),
+                    "finance_program": json.dumps(
+                        question_log.get("finance_program"), sort_keys=True
+                    ),
+                    "finance_verification": json.dumps(
+                        question_log.get("finance_verification"), sort_keys=True
+                    ),
+                    "correction_plan": json.dumps(
+                        attempt.get("correction_plan") or {}, sort_keys=True
+                    ),
+                    "correction_action": (
+                        (attempt.get("correction_plan") or {}).get("action")
+                    ),
+                    "evidence_manifest": json.dumps(
+                        attempt.get("evidence_manifest", {}), sort_keys=True
+                    ),
+                    "final_evidence_manifest": json.dumps(
+                        question_log.get("evidence_manifest", {}), sort_keys=True
+                    ),
                     "improvement_from_retry": question_log["improvement_from_retry"],
                     "total_attempts": len(question_log["attempts"]),
                 }
@@ -199,10 +329,19 @@ class AgentLogger:
             if len(q["attempts"]) > 1
         )
 
+        evaluated_questions = sum(
+            1 for q in self.questions.values()
+            if q.get("correct") is not None
+        )
         correct_count = sum(
             1 for q in self.questions.values()
-            if q.get("correct")
+            if q.get("correct") is True
         )
+        policy_decisions = [
+            q.get("policy_accepted")
+            for q in self.questions.values()
+            if q.get("policy_accepted") is not None
+        ]
 
         retry_improvements = sum(
             1 for q in self.questions.values()
@@ -227,8 +366,19 @@ class AgentLogger:
             "total_questions": total_questions,
             "questions_with_retry": questions_with_retry,
             "retry_rate": questions_with_retry / total_questions if total_questions > 0 else 0,
-            "accuracy": correct_count / total_questions if total_questions > 0 else 0,
+            "evaluated_questions": evaluated_questions,
+            "labeled_correctness_rate": (
+                correct_count / evaluated_questions
+                if evaluated_questions > 0
+                else None
+            ),
+            "policy_acceptance_rate": (
+                sum(policy_decisions) / len(policy_decisions)
+                if policy_decisions
+                else None
+            ),
             "retry_success_rate": retry_improvements / questions_with_retry if questions_with_retry > 0 else 0,
+            "policy_score_improvement_rate": retry_improvements / questions_with_retry if questions_with_retry > 0 else 0,
             "avg_attempts": total_attempts / total_questions if total_questions > 0 else 0,
             "avg_judge_score": sum(judge_scores) / len(judge_scores) if judge_scores else 0,
         }
@@ -243,8 +393,16 @@ class AgentLogger:
         print(f"Session ID: {stats.get('session_id', 'N/A')}")
         print(f"Total questions: {stats['total_questions']}")
         print(f"Questions with retry: {stats.get('questions_with_retry', 0)} ({stats.get('retry_rate', 0):.1%})")
-        print(f"Accuracy: {stats.get('accuracy', 0):.1%}")
-        print(f"Retry success rate: {stats.get('retry_success_rate', 0):.1%}")
+        labeled_correctness = stats.get("labeled_correctness_rate")
+        acceptance_rate = stats.get("policy_acceptance_rate")
+        print(
+            f"Oracle-guided fixed-threshold correctness label: {labeled_correctness:.1%}"
+            if labeled_correctness is not None
+            else "Correctness: N/A (not independently evaluated)"
+        )
+        if acceptance_rate is not None:
+            print(f"Policy acceptance rate: {acceptance_rate:.1%}")
+        print(f"Policy-score improvement rate: {stats.get('policy_score_improvement_rate', 0):.1%}")
         print(f"Average attempts: {stats.get('avg_attempts', 0):.2f}")
         print(f"Average judge score: {stats.get('avg_judge_score', 0):.3f}")
         print("=" * 60 + "\n")

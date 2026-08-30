@@ -1,23 +1,16 @@
-# from langchain_community.vectorstores import Chroma
-from langchain_chroma import Chroma
-from langchain_openai import OpenAIEmbeddings
-from langchain_classic.tools.retriever import create_retriever_tool
-from dotenv import load_dotenv
-from langchain.tools import tool
-from langchain_together import TogetherEmbeddings
-from langchain.prompts import PromptTemplate
-from langchain_together import Together
-from langchain.chains import LLMChain
-import openai
 import os
 from pathlib import Path
+
+import openai
+from dotenv import load_dotenv
+from langchain_chroma import Chroma
+from langchain_openai import OpenAIEmbeddings
 
 load_dotenv()
 
 # path to chromadb persistence directory (relative to project root)
 BASE_DIR = Path(__file__).parent.parent
 CHROMA_PATH = str(BASE_DIR / "chroma")
-embeddings = OpenAIEmbeddings(model="text-embedding-3-large")
 
 def main():
 
@@ -66,6 +59,7 @@ def main():
 
 def load_database():
     # load existing chromadb instance from persistent directory using openai embeddings
+    embeddings = OpenAIEmbeddings(model="text-embedding-3-large")
     db = Chroma(
         persist_directory=CHROMA_PATH,
         embedding_function=embeddings

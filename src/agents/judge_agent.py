@@ -6,7 +6,6 @@ answer), uses numeric grounding verification to check that all numbers in
 the answer are supported by the retrieved documents.
 """
 
-from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 
 from langchain_core.documents import Document
@@ -17,7 +16,14 @@ from evaluation.deterministic_verify import (
     deterministic_verify,
     format_verification_feedback,
 )
-from evaluation.numeric_check import extract_numbers, NumericValue
+from evaluation.numeric_check import (
+    apply_context_scale,
+    extract_numbers,
+    find_numeric_match,
+    infer_scale,
+    is_likely_year,
+    strip_evidence_citations,
+)
 
 
 class JudgeAgent(BaseAgent):
@@ -40,6 +46,7 @@ class JudgeAgent(BaseAgent):
         judge_model: str = None,
         retry_threshold: float = 0.5,
         min_threshold: float = 0.3,
+        threshold_decay: float = 0.1,
         enable_deterministic_gate: bool = True,
         require_all_numbers_cited: bool = True,
     ):
@@ -49,6 +56,8 @@ class JudgeAgent(BaseAgent):
             judge_model: Model to use for LLM-as-judge evaluation
             retry_threshold: Score below which to trigger retry (default 0.5)
             min_threshold: Minimum threshold even after escalation (default 0.3)
+            threshold_decay: Per-attempt threshold reduction. Use zero for the
+                v2 calibrated policy; ``0.1`` reproduces the paper policy.
             enable_deterministic_gate: Run deterministic verification before LLM judge
             require_all_numbers_cited: Require all numerical claims to have citations
         """
@@ -58,6 +67,7 @@ class JudgeAgent(BaseAgent):
         self.judge_model = judge_model or DEFAULTS.judge_model
         self.retry_threshold = retry_threshold
         self.min_threshold = min_threshold
+        self.threshold_decay = max(0.0, float(threshold_decay))
         self.enable_deterministic_gate = enable_deterministic_gate
         self.require_all_numbers_cited = require_all_numbers_cited
 
@@ -107,7 +117,7 @@ class JudgeAgent(BaseAgent):
             # Augment with numeric grounding check against source documents
             if docs:
                 grounding_score, grounding_explanation = self._blind_numeric_verify(
-                    predicted_answer, docs
+                    predicted_answer, docs, question=question
                 )
 
                 # Combine: weight numeric grounding heavily for financial QA
@@ -142,19 +152,23 @@ class JudgeAgent(BaseAgent):
         """
         from src.providers import get_provider
 
-        system_prompt = """You are evaluating the quality of an answer to a question.
-You do NOT have access to the correct answer, so evaluate based on:
-1. Coherence: Is the answer clear and well-structured?
-2. Specificity: Does it provide concrete information (numbers, names, dates)?
-3. Relevance: Does it actually address what the question asks?
-4. Confidence: Does it avoid excessive hedging or refusals?
+        system_prompt = """You are evaluating response coverage, not factual correctness.
+You do NOT have access to the correct answer. Do not reward confident language,
+extra numbers, verbosity, or a willingness to guess. Evaluate only:
+1. Requirement coverage: Does it address every explicit part of the question?
+2. Relevance: Is each part responsive to the requested entity, metric, and period?
+3. Clarity: Does it distinguish reported facts, calculations, and uncertainty?
+4. Selectivity: If required evidence is missing, does it identify the precise gap
+   instead of inventing a conclusion?
 
 Score from 0.0 to 1.0:
-- 1.0: Excellent - specific, coherent, directly addresses the question
-- 0.7: Good - mostly specific with minor issues
-- 0.5: Acceptable - somewhat vague but on topic
-- 0.3: Poor - vague, hedging, or partially off-topic
-- 0.0: Failure - refused to answer or completely off-topic
+- 1.0: All explicit requirements are addressed clearly
+- 0.7: Most requirements are addressed with minor omissions
+- 0.5: Partially addresses the requested work
+- 0.3: Major requirements are omitted or the response is mostly off-topic
+- 0.0: Empty, unrelated, or fabricated-looking response
+
+This score is not a confidence estimate and must not be described as accuracy.
 
 Respond with:
 SCORE: <score>
@@ -166,25 +180,24 @@ Answer: {answer}
 
 Evaluate the quality of this answer."""
 
-        try:
-            provider = get_provider(self.judge_model)
-            response = provider.generate(
-                system_prompt=system_prompt,
-                user_prompt=user_prompt,
-                max_tokens=200,
-                temperature=0.0,
-            )
+        provider = get_provider(self.judge_model)
+        response = provider.generate(
+            system_prompt=system_prompt,
+            user_prompt=user_prompt,
+            max_tokens=200,
+            temperature=0.0,
+        )
 
-            # Parse response
-            from evaluation.llm_judge import parse_judge_response
-            return parse_judge_response(response.content)
-        except Exception as e:
-            return 0.0, f"Self-evaluation failed: {str(e)}"
+        # Provider failures must remain infrastructure errors rather than being
+        # converted into a model-quality score of zero.
+        from evaluation.llm_judge import parse_judge_response
+        return parse_judge_response(response.content)
 
     def _blind_numeric_verify(
         self,
         answer: str,
         docs: List[Document],
+        question: str = "",
         relative_tolerance: float = 0.05,
     ) -> Tuple[float, str]:
         """Verify that numbers in the answer are grounded in source documents.
@@ -205,24 +218,36 @@ Evaluate the quality of this answer."""
             return 0.5, "No answer or documents to verify"
 
         # Extract numbers from answer (high-confidence only)
-        answer_nums = extract_numbers(answer)
-        # Filter to significant numbers (skip years, small integers likely to be ordinals)
+        # Evidence quotes are not answer claims. Including their numbers lets a
+        # wrong answer appear grounded merely because its citation contains the
+        # correct value.
+        answer_nums = extract_numbers(strip_evidence_citations(answer))
+        # Skip standalone years and small untyped ordinals, but retain values
+        # such as 0.5%, $0.8M, and 0.7x.
         significant_nums = [
             n for n in answer_nums
             if n.confidence >= 0.5
             and not (1900 <= n.value <= 2100 and n.unit == "")  # Skip standalone years
-            and abs(n.value) > 1  # Skip trivially small numbers
+            and (abs(n.value) > 1 or bool(n.unit) or bool(n.currency))
         ]
 
         if not significant_nums:
             return 0.7, "No significant numeric claims to verify"
 
         # Extract numbers from all source documents
-        source_text = " ".join(doc.page_content for doc in docs)
-        source_nums = extract_numbers(source_text)
-        source_values = [n.value for n in source_nums]
+        source_nums = []
+        for doc in docs:
+            doc_numbers = extract_numbers(doc.page_content)
+            source_nums.extend(doc_numbers)
+            scale = infer_scale(doc.page_content)
+            if scale:
+                source_nums.extend(
+                    apply_context_scale(number, scale)
+                    for number in doc_numbers
+                    if not number.explicit_scale and not is_likely_year(number)
+                )
 
-        if not source_values:
+        if not source_nums:
             # Documents have no numbers but answer does -- suspicious
             if significant_nums:
                 return 0.2, f"Answer contains {len(significant_nums)} numbers but sources contain none"
@@ -232,21 +257,17 @@ Evaluate the quality of this answer."""
         grounded = []
         ungrounded = []
 
+        sign_insensitive = any(
+            term in (question or answer).lower()
+            for term in ("capex", "capital expenditure", "cash paid", "outflow")
+        )
         for ans_num in significant_nums:
-            found_match = False
-            for src_val in source_values:
-                if src_val == 0:
-                    if ans_num.value == 0:
-                        found_match = True
-                        break
-                    continue
-
-                rel_diff = abs(ans_num.value - src_val) / abs(src_val)
-                if rel_diff <= relative_tolerance:
-                    found_match = True
-                    break
-
-            if found_match:
+            if find_numeric_match(
+                ans_num,
+                source_nums,
+                relative_tolerance=relative_tolerance,
+                allow_absolute_value=sign_insensitive,
+            ):
                 grounded.append(ans_num)
             else:
                 ungrounded.append(ans_num)
@@ -272,6 +293,7 @@ Evaluate the quality of this answer."""
         self,
         answer: str,
         docs: List[Document],
+        question: str = "",
     ) -> VerificationResult:
         """Run deterministic verification as a hard gate before LLM judge.
 
@@ -288,6 +310,7 @@ Evaluate the quality of this answer."""
             answer=answer,
             docs=docs,
             require_all_numbers_cited=self.require_all_numbers_cited,
+            question=question,
         )
         self._last_verification = result
         return result
@@ -317,23 +340,21 @@ Evaluate the quality of this answer."""
         if attempt >= max_retries:
             return False
 
-        # Adjust threshold based on attempt (lower threshold on later attempts)
-        # This avoids infinite loops on consistently low-scoring questions
-        adjusted_threshold = max(
-            self.min_threshold,
-            self.retry_threshold - (attempt * 0.1)
-        )
+        adjusted_threshold = self.acceptance_threshold(attempt)
 
         # Check if score is below threshold
         if score < adjusted_threshold:
-            # Additional check: if score is improving, maybe don't retry
-            if len(self._attempt_scores) > 0:
-                if score >= self._attempt_scores[-1] + 0.2:
-                    # Significant improvement, accept even if below threshold
-                    return False
             return True
 
         return False
+
+    def acceptance_threshold(self, attempt: int) -> float:
+        """Return the policy threshold used for a specific attempt."""
+
+        return max(
+            self.min_threshold,
+            self.retry_threshold - (attempt * self.threshold_decay),
+        )
 
     def decide(self, context: Dict[str, Any]) -> AgentDecision:
         """Evaluate the answer and decide whether to retry.
@@ -355,6 +376,187 @@ Evaluate the quality of this answer."""
         attempt = context.get("attempt", self._attempt)
         max_retries = context.get("max_retries", 1)
         docs = context.get("documents", [])
+        require_finance_program = bool(context.get("require_finance_program"))
+        finance_program = context.get("finance_program")
+        finance_program_issues = list(context.get("finance_program_issues") or ())
+        finance_question_spec = context.get("finance_question_spec")
+
+        if require_finance_program:
+            from src.finance_program import verify_program
+
+            if finance_program_issues:
+                issue_payloads = finance_program_issues
+                program_verification = {
+                    "passed": False,
+                    "fully_verified": False,
+                    "assurance_level": "unverified",
+                    "issues": issue_payloads,
+                    "execution": None,
+                    "rendered_answer": None,
+                    "evidence_coverage": 0.0,
+                }
+            elif finance_program is None:
+                issue_payloads = [
+                    {
+                        "code": "missing_program",
+                        "message": "A typed finance program is required for this calculation",
+                    }
+                ]
+                program_verification = {
+                    "passed": False,
+                    "fully_verified": False,
+                    "assurance_level": "unverified",
+                    "issues": issue_payloads,
+                    "execution": None,
+                    "rendered_answer": None,
+                    "evidence_coverage": 0.0,
+                }
+            elif finance_question_spec is None:
+                issue_payloads = [
+                    {
+                        "code": "unsupported_claim",
+                        "message": "The calculation has no fully resolved pre-generation contract",
+                    }
+                ]
+                program_verification = {
+                    "passed": False,
+                    "fully_verified": False,
+                    "assurance_level": "unverified",
+                    "issues": issue_payloads,
+                    "execution": None,
+                    "rendered_answer": None,
+                    "evidence_coverage": 0.0,
+                }
+            else:
+                result = verify_program(
+                    finance_program,
+                    docs,
+                    question,
+                    question_spec=finance_question_spec,
+                    answer_text=predicted_answer,
+                    require_full_contract=True,
+                )
+                program_verification = result.to_dict()
+                issue_payloads = program_verification["issues"]
+
+            reason_codes = [issue["code"] for issue in issue_payloads]
+            if program_verification.get("fully_verified"):
+                score = float(program_verification.get("evidence_coverage", 1.0))
+                self._attempt_scores.append(score)
+                decision = AgentDecision(
+                    agent_name=self.name,
+                    decision_type="typed_finance_verification",
+                    decision_value={
+                        "score": score,
+                        "pass": True,
+                        "retry": False,
+                        "abstain": False,
+                        "justification": (
+                            "Typed program, trusted question contract, every operand, "
+                            "arithmetic trace, and rendered answer all verified."
+                        ),
+                        "verification_passed": True,
+                        "verification_feedback": "",
+                        "verification_reason_codes": [],
+                        "verification_issues": [],
+                        "finance_program_verification": program_verification,
+                        "canonical_answer": program_verification.get(
+                            "rendered_answer"
+                        ),
+                        "acceptance_threshold": self.acceptance_threshold(attempt),
+                    },
+                    confidence=score,
+                    reasoning="Accepted by full-contract typed finance verification.",
+                    metadata={
+                        "attempt": attempt,
+                        "accepted_by": "typed_finance_full_contract",
+                        "has_gold_answer": False,
+                        "finance_program_verification": program_verification,
+                        "verification_reason_codes": [],
+                    },
+                )
+                self.log_decision(decision)
+                return decision
+
+            feedback = "; ".join(
+                issue.get("message", issue.get("code", "verification failed"))
+                for issue in issue_payloads
+            )
+            canonical_answer = program_verification.get("rendered_answer")
+            locally_repairable = bool(canonical_answer) and set(reason_codes) <= {
+                "answer_result_mismatch",
+                "result_value_mismatch",
+            }
+            if locally_repairable:
+                from src.finance_program import repair_program_result
+
+                repaired_program, repaired_result = repair_program_result(
+                    finance_program,
+                    docs,
+                    question,
+                    question_spec=finance_question_spec,
+                    answer_text=predicted_answer,
+                )
+                repaired_verification = repaired_result.to_dict()
+                if repaired_program is None or not repaired_result.fully_verified:
+                    locally_repairable = False
+
+            if locally_repairable:
+                decision = AgentDecision(
+                    agent_name=self.name,
+                    decision_type="typed_finance_local_repair",
+                    decision_value={
+                        "score": float(
+                            program_verification.get("evidence_coverage", 0.0)
+                        ),
+                        "pass": False,
+                        "retry": True,
+                        "abstain": False,
+                        "justification": feedback,
+                        "verification_passed": False,
+                        "verification_feedback": feedback,
+                        "verification_reason_codes": reason_codes,
+                        "verification_issues": issue_payloads,
+                        "finance_program_verification": program_verification,
+                        "canonical_answer": repaired_result.rendered_answer,
+                        "repaired_finance_program": repaired_program.model_dump(
+                            mode="json"
+                        ),
+                        "repaired_finance_program_verification": (
+                            repaired_verification
+                        ),
+                    },
+                    confidence=float(
+                        program_verification.get("evidence_coverage", 0.0)
+                    ),
+                    reasoning="A deterministic local result can repair the generated display/value.",
+                    metadata={
+                        "attempt": attempt,
+                        "deterministic_gate_triggered": True,
+                        "finance_program_verification": program_verification,
+                        "verification_reason_codes": reason_codes,
+                    },
+                )
+                self.log_decision(decision)
+                return decision
+
+            reason = f"Typed finance verification failed: {feedback}"
+            if attempt >= max_retries:
+                return self._create_abstain_decision(
+                    attempt=attempt,
+                    reason=reason,
+                    reason_codes=reason_codes,
+                    verification_issues=issue_payloads,
+                    finance_program_verification=program_verification,
+                )
+            return self._create_retry_decision(
+                attempt=attempt,
+                reason=reason,
+                verification_feedback=feedback,
+                reason_codes=reason_codes,
+                verification_issues=issue_payloads,
+                finance_program_verification=program_verification,
+            )
 
         # DETERMINISTIC GATE: Run verification before LLM judge
         verification_passed = True
@@ -362,7 +564,7 @@ Evaluate the quality of this answer."""
 
         if self.enable_deterministic_gate and docs:
             verification_result = self.run_deterministic_verification(
-                predicted_answer, docs
+                predicted_answer, docs, question=question
             )
             verification_passed = verification_result.passed
             verification_message = verification_result.message
@@ -374,6 +576,7 @@ Evaluate the quality of this answer."""
                     return self._create_abstain_decision(
                         attempt=attempt,
                         reason=f"Deterministic verification failed after {attempt + 1} attempts: {verification_message}",
+                        reason_codes=verification_result.reason_codes,
                     )
                 else:
                     # Trigger retry without calling LLM judge
@@ -381,20 +584,28 @@ Evaluate the quality of this answer."""
                         attempt=attempt,
                         reason=f"Deterministic verification failed: {verification_message}",
                         verification_feedback=self.get_verification_feedback(),
+                        reason_codes=verification_result.reason_codes,
                     )
 
         # Deterministic check passed - proceed to LLM-as-judge evaluation
         # Pass docs for blind numeric verification when no gold answer
-        score, justification = self.evaluate(question, predicted_answer, gold_answer, docs=docs)
+        score, justification = self.evaluate(
+            question, predicted_answer, gold_answer, docs=docs
+        )
 
-        # Track score for this attempt
+        # Compute improvement against the previous attempt before appending the
+        # current score. Improvement is diagnostic only; it cannot bypass tau.
+        previous_score = self._attempt_scores[-1] if self._attempt_scores else None
+        adjusted_threshold = self.acceptance_threshold(attempt)
+        significant_improvement = (
+            previous_score is not None and score >= previous_score + 0.2
+        )
+        should_retry = self.should_retry(score, attempt, max_retries)
         self._attempt_scores.append(score)
 
-        # Decide whether to retry
-        should_retry = self.should_retry(score, attempt, max_retries)
-
-        # Determine pass/fail
-        passed = score >= 0.5
+        # Stopping because the retry budget is exhausted is not acceptance.
+        # Match the documented policy exactly: U_t must meet tau_t.
+        passed = score >= adjusted_threshold
 
         # Build reasoning
         if should_retry:
@@ -403,7 +614,10 @@ Evaluate the quality of this answer."""
                 f"Triggering retry. {justification}"
             )
         elif passed:
-            reasoning = f"Answer accepted with score {score:.2f}. {justification}"
+            reasoning = (
+                f"Answer accepted with score {score:.2f} at threshold "
+                f"{adjusted_threshold:.2f}. {justification}"
+            )
         else:
             reasoning = (
                 f"Answer failed with score {score:.2f}, "
@@ -420,15 +634,28 @@ Evaluate the quality of this answer."""
                 "abstain": False,
                 "justification": justification,
                 "verification_passed": verification_passed,
+                "verification_feedback": justification if should_retry else "",
+                "acceptance_threshold": adjusted_threshold,
             },
             confidence=score,  # Use score as confidence
             reasoning=reasoning,
             metadata={
                 "attempt": attempt,
-                "threshold": self.retry_threshold,
+                "threshold": adjusted_threshold,
+                "base_threshold": self.retry_threshold,
+                "threshold_decay": self.threshold_decay,
+                "accepted_by": (
+                    "threshold" if score >= adjusted_threshold else "rejected"
+                ),
+                "significant_improvement": significant_improvement,
                 "has_gold_answer": gold_answer is not None,
                 "attempt_scores": self._attempt_scores.copy(),
                 "verification_message": verification_message,
+                "verification_reason_codes": (
+                    self._last_verification.reason_codes
+                    if self._last_verification is not None
+                    else []
+                ),
             }
         )
 
@@ -440,6 +667,9 @@ Evaluate the quality of this answer."""
         attempt: int,
         reason: str,
         verification_feedback: str = "",
+        reason_codes: Optional[List[str]] = None,
+        verification_issues: Optional[List[Dict[str, Any]]] = None,
+        finance_program_verification: Optional[Dict[str, Any]] = None,
     ) -> AgentDecision:
         """Create a decision to retry due to verification failure.
 
@@ -462,12 +692,17 @@ Evaluate the quality of this answer."""
                 "justification": reason,
                 "verification_passed": False,
                 "verification_feedback": verification_feedback,
+                "verification_reason_codes": list(reason_codes or ()),
+                "verification_issues": list(verification_issues or ()),
+                "finance_program_verification": finance_program_verification,
             },
             confidence=0.0,
             reasoning=f"Retry triggered: {reason}",
             metadata={
                 "attempt": attempt,
                 "deterministic_gate_triggered": True,
+                "verification_reason_codes": list(reason_codes or ()),
+                "finance_program_verification": finance_program_verification,
             }
         )
         self.log_decision(decision)
@@ -477,6 +712,9 @@ Evaluate the quality of this answer."""
         self,
         attempt: int,
         reason: str,
+        reason_codes: Optional[List[str]] = None,
+        verification_issues: Optional[List[Dict[str, Any]]] = None,
+        finance_program_verification: Optional[Dict[str, Any]] = None,
     ) -> AgentDecision:
         """Create a decision to abstain due to insufficient evidence.
 
@@ -501,6 +739,9 @@ Evaluate the quality of this answer."""
                 "abstain": True,
                 "justification": "Insufficient evidence in retrieved corpus",
                 "verification_passed": False,
+                "verification_reason_codes": list(reason_codes or ()),
+                "verification_issues": list(verification_issues or ()),
+                "finance_program_verification": finance_program_verification,
             },
             confidence=0.0,
             reasoning=f"ABSTAIN: {reason}",
@@ -508,6 +749,8 @@ Evaluate the quality of this answer."""
                 "attempt": attempt,
                 "abstain_reason": reason,
                 "deterministic_gate_triggered": True,
+                "verification_reason_codes": list(reason_codes or ()),
+                "finance_program_verification": finance_program_verification,
             }
         )
         self.log_decision(decision)

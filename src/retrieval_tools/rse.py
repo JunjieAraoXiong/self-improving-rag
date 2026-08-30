@@ -27,8 +27,8 @@ def get_chunk_position(chunk: Document, fallback_rank: int = 0) -> int:
     """Get chunk position for adjacency detection.
 
     Priority:
-    1. 'page' metadata (traditional page-based chunking)
-    2. 'chunk_index' metadata (sequential order from ingestion)
+    1. 'chunk_index' metadata (sequential order from ingestion)
+    2. 'page' metadata (traditional page-based chunking)
     3. fallback_rank (position in current retrieval results)
 
     Args:
@@ -38,15 +38,15 @@ def get_chunk_position(chunk: Document, fallback_rank: int = 0) -> int:
     Returns:
         Integer position for adjacency comparison
     """
-    # Try page first (original behavior)
-    page = chunk.metadata.get("page")
-    if page is not None:
-        return int(page)
-
-    # Try chunk_index (sequential order from ingestion)
+    # A page can contain several chunks. Prefer the global chunk index so
+    # retrieval rank cannot scramble chunks that share the same page.
     chunk_index = chunk.metadata.get("chunk_index")
     if chunk_index is not None:
         return int(chunk_index)
+
+    page = chunk.metadata.get("page")
+    if page is not None:
+        return int(page)
 
     # Fallback to retrieval rank within document
     return fallback_rank

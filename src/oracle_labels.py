@@ -10,10 +10,10 @@ the optimal pipeline per question. Used to:
 import sys
 import json
 import argparse
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Optional, Any
+from typing import Any, Dict
 
 import pandas as pd
 from dotenv import load_dotenv
@@ -285,7 +285,7 @@ def main():
     with open(json_path, "w") as f:
         json.dump(analysis, f, indent=2)
 
-    print(f"\nResults saved to:")
+    print("\nResults saved to:")
     print(f"  CSV: {csv_path}")
     print(f"  Analysis: {json_path}")
 
@@ -293,15 +293,15 @@ def main():
     print("\n" + "=" * 60)
     print("ORACLE ANALYSIS SUMMARY")
     print("=" * 60)
-    print(f"\nPipeline Distribution:")
+    print("\nPipeline Distribution:")
     for pipeline, pct in analysis["pipeline_percentages"].items():
         print(f"  {pipeline}: {pct}%")
 
-    print(f"\nMean Scores:")
+    print("\nMean Scores:")
     for pipeline in PIPELINES:
         print(f"  {pipeline}: {analysis[f'{pipeline}_mean']}")
 
-    print(f"\nKey Metrics:")
+    print("\nKey Metrics:")
     print(f"  Oracle (upper bound): {analysis['oracle_mean']}")
     print(f"  Best fixed ({analysis['best_fixed_pipeline']}): {analysis['best_fixed_mean']}")
     print(f"  Potential gain: {analysis['potential_gain']}")
@@ -310,7 +310,7 @@ def main():
     print(f"\n{'✓' if analysis['routing_worthwhile'] else '✗'} Routing worthwhile: {analysis['routing_worthwhile']}")
 
     if "by_question_type" in analysis:
-        print(f"\nBy Question Type:")
+        print("\nBy Question Type:")
         for qtype, stats in analysis["by_question_type"].items():
             print(f"  {qtype} (n={stats['count']}): oracle={stats['oracle_mean']}")
 

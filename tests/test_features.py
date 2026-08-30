@@ -9,9 +9,6 @@ Usage:
     pytest tests/test_features.py -v      # Verbose output
 """
 
-import pytest
-
-
 class TestQuestionFeatures:
     """Tests for the QuestionFeatures dataclass."""
 

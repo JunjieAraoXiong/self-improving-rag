@@ -9,7 +9,7 @@ def main():
         import pandas as pd
         from datasets import Dataset
         df = pd.DataFrame({'test': [1, 2, 3]})
-        ds = Dataset.from_pandas(df)
+        Dataset.from_pandas(df)
         print("✓ HF Datasets <-> PyArrow integration working!")
     except Exception as e:
         print(f"✗ CRASHED: {e}")

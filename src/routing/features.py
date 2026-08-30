@@ -6,7 +6,7 @@ retrieval pipeline will perform best. All extraction is rule-based
 """
 
 import re
-from dataclasses import dataclass, field, asdict
+from dataclasses import asdict, dataclass
 from typing import Dict, List, Optional, Set
 
 
@@ -293,8 +293,6 @@ def analyze_feature_distribution(questions: List[str]) -> Dict[str, Dict[str, fl
 # =============================================================================
 
 if __name__ == "__main__":
-    import json
-
     test_questions = [
         "What is the FY2018 capital expenditure amount for 3M?",
         "What was Apple's revenue in 2022?",

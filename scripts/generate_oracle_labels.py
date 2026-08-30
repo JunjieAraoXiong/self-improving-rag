@@ -30,7 +30,7 @@ import time
 import argparse
 from pathlib import Path
 from datetime import datetime
-from typing import Dict, Any, List, Tuple
+from typing import Any, Dict, Tuple
 
 from tqdm import tqdm
 from dotenv import load_dotenv
@@ -48,7 +48,6 @@ from src.retrieval_tools.tool_registry import (
 from src.config import (
     DEFAULTS,
     get_embedding_model,
-    get_provider_for_model,
 )
 from src.providers import get_provider
 
@@ -445,7 +444,7 @@ Answer:"""
             pipeline_counts[key] = pipeline_counts.get(key, 0) + 1
 
         avg_score = (
-            sum(l["best_score"] for l in labels.values()) / len(labels)
+            sum(label["best_score"] for label in labels.values()) / len(labels)
             if labels else 0
         )
 

@@ -1,5 +1,6 @@
 """FinanceBench dataset adapter."""
 
+import hashlib
 import json
 from pathlib import Path
 from typing import List, Optional
@@ -71,6 +72,15 @@ class FinanceBenchAdapter(BaseDatasetAdapter):
 
         # Apply subset filter if specified
         df = self._apply_subset_filter(df)
+        questions_path = Path(self.questions_path).expanduser().resolve()
+        self._selection_metadata.update(
+            {
+                "dataset_path": str(questions_path),
+                "dataset_file_sha256": hashlib.sha256(
+                    questions_path.read_bytes()
+                ).hexdigest(),
+            }
+        )
 
         self._df = df
         return df

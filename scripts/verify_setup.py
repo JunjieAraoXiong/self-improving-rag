@@ -42,7 +42,7 @@ def check_chromadb(chroma_path: str) -> bool:
         conn.close()
 
         if chunks == 0:
-            print(f"❌ ChromaDB is empty: 0 chunks")
+            print("❌ ChromaDB is empty: 0 chunks")
             return False
 
         print(f"✅ ChromaDB: {chunks:,} chunks available")

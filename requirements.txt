@@ -5,24 +5,26 @@
 pandas>=2.0.0
 numpy>=1.24.0
 tqdm>=4.65.0
+pydantic>=2.7.0,<3.0.0  # Typed finance plans/programs and strict output validation
 
 # HuggingFace datasets
 datasets>=2.14.0
 
 # LangChain and vector stores
-langchain>=0.1.0
-langchain-chroma>=0.1.0
-langchain-openai>=0.0.5
-langchain-text-splitters>=0.0.1
-langchain-community>=0.0.1
-langchain-core>=0.1.0
+langchain==0.3.27
+langchain-chroma==0.2.6
+langchain-openai==0.3.35
+langchain-text-splitters==0.3.11
+langchain-community==0.3.31
+langchain-core==0.3.80
+langchain-together==0.3.1
 chromadb>=0.4.0
 rank_bm25>=0.2.2
 
 # API clients
 openai>=1.0.0
 anthropic>=0.40.0
-google-generativeai>=0.8.0
+google-genai>=1.0.0,<2.0.0
 cohere>=5.0.0
 
 # Environment management
@@ -34,7 +36,10 @@ pillow>=10.0.0
 
 # Reranking and local embeddings
 sentence-transformers>=2.2.0
-langchain-huggingface>=0.0.3
+langchain-huggingface>=0.3.1,<0.4.0
 
 # HTML parsing
 beautifulsoup4>=4.12.0
+
+# Development and offline regression tests
+pytest>=8.0.0,<10.0.0

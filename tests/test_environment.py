@@ -154,7 +154,7 @@ class TestImports:
 
     def test_retrieval_tools_import(self):
         """Test retrieval tools imports."""
-        from src.retrieval_tools.tool_registry import list_pipelines, build_pipeline
+        from src.retrieval_tools.tool_registry import list_pipelines
 
         pipelines = list_pipelines()
         assert pipelines is not None

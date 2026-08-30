@@ -1,4 +1,4 @@
-"""Agentic RAG system for self-improving document QA.
+"""Agentic RAG system for evidence-gap-driven document QA.
 
 This module implements a multi-agent architecture where:
 - RetrievalAgent: Decides retrieval strategy (pipeline, top_k)
@@ -13,7 +13,13 @@ from .logger import AgentLogger
 from .retrieval_agent import RetrievalAgent
 from .reasoning_agent import ReasoningAgent
 from .judge_agent import JudgeAgent
-from .orchestrator import AgenticRAGOrchestrator
+from .correction_policy import (
+    CorrectionAction,
+    CorrectionPlan,
+    CorrectionPolicy,
+    PolicyMode,
+)
+from .orchestrator import AgenticRAGConfig, AgenticRAGOrchestrator
 
 __all__ = [
     "AgentDecision",
@@ -22,5 +28,10 @@ __all__ = [
     "RetrievalAgent",
     "ReasoningAgent",
     "JudgeAgent",
+    "CorrectionAction",
+    "CorrectionPlan",
+    "CorrectionPolicy",
+    "PolicyMode",
+    "AgenticRAGConfig",
     "AgenticRAGOrchestrator",
 ]

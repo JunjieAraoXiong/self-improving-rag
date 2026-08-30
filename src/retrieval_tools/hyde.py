@@ -20,6 +20,8 @@ from langchain_core.documents import Document
 # Re-export from router for backwards compatibility
 from .router import HyDEGenerator, HyDERetriever, get_hyde_generator
 
+__all__ = ["HyDE", "HyDEGenerator", "HyDERetriever", "get_hyde_generator"]
+
 
 class HyDE:
     """Standalone HyDE wrapper for easy integration with any retriever.
