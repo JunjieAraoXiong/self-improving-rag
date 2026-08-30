@@ -29,7 +29,7 @@ def build_hybrid_retriever(
         EnsembleRetriever combining BM25 and semantic search
     """
     from langchain_community.retrievers import BM25Retriever
-    from langchain_classic.retrievers.ensemble import EnsembleRetriever
+    from langchain.retrievers import EnsembleRetriever
 
     if weights is None:
         weights = DEFAULT_ENSEMBLE_WEIGHTS
@@ -47,13 +47,10 @@ def build_hybrid_retriever(
         for text, meta in zip(all_docs["documents"], all_docs["metadatas"])
     ]
 
-    # If filter returned no docs, fall back to unfiltered
+    # A requested metadata filter is a correctness boundary. Never substitute
+    # an unfiltered lexical corpus when the filter has no matches.
     if not documents:
-        all_docs = db.get()
-        documents = [
-            LCDocument(page_content=text, metadata=meta)
-            for text, meta in zip(all_docs["documents"], all_docs["metadatas"])
-        ]
+        raise ValueError(f"No documents matched metadata filter: {metadata_filter}")
 
     bm25_retriever = BM25Retriever.from_documents(documents)
     bm25_retriever.k = top_k

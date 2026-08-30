@@ -6,8 +6,7 @@ Generates publication-ready tables with:
 - Proper formatting for academic papers
 """
 
-from typing import Dict, List, Optional, Tuple, Any
-import numpy as np
+from typing import Any, Dict, List, Tuple
 from .metrics import bootstrap_compare
 
 
@@ -146,7 +145,6 @@ def generate_results_table(
         rows.append(" & ".join(cells) + r" \\")
 
     # Assemble table
-    n_cols = len(metrics) + 1
     col_spec = "l" + "c" * len(metrics)
 
     table_lines = [
@@ -196,7 +194,7 @@ def generate_ablation_table(
     headers = ["Ablation"]
     for m in metrics:
         name = metric_display.get(m, m)
-        headers.extend([name, f"Δ"])
+        headers.extend([name, "Δ"])
     header = " & ".join(headers) + r" \\"
 
     # Get full system values
@@ -230,7 +228,6 @@ def generate_ablation_table(
         rows.append(" & ".join(cells) + r" \\")
 
     # Assemble table
-    n_cols = 1 + len(metrics) * 2
     col_spec = "l" + "cc" * len(metrics)
 
     table_lines = [

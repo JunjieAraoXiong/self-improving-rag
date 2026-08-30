@@ -4,7 +4,7 @@ Supports both local cross-encoders and API-based rerankers (Cohere, Jina).
 """
 
 import os
-from typing import List, Optional, Protocol
+from typing import List, Optional
 from langchain_core.documents import Document
 
 
@@ -66,7 +66,11 @@ class Reranker:
         ]
         scored_docs.sort(key=lambda x: x[1], reverse=True)
 
-        return [doc for doc, _ in scored_docs[:top_k]]
+        reranked = []
+        for doc, score in scored_docs[:top_k]:
+            doc.metadata["rerank_score"] = float(score)
+            reranked.append(doc)
+        return reranked
 
 
 class CohereReranker:

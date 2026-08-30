@@ -7,7 +7,7 @@ retrieval pipeline for each question based on extracted features.
 import json
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional
 
 import numpy as np
 

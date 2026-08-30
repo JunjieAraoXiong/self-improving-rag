@@ -1,7 +1,7 @@
 """Retrieval Agent: Decides retrieval strategy for each question."""
 
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Dict, List, Optional
 
 from langchain_core.documents import Document
@@ -38,16 +38,7 @@ ESCALATION_STRATEGIES = [
         use_hyde=False,
         use_rerank=True,
     ),
-    # Attempt 2: Use RSE for richer context windows
-    RetrievalStrategy(
-        pipeline_id="hybrid_filter_rerank",
-        top_k=25,
-        initial_k_factor=5.0,
-        use_hyde=False,
-        use_rse=True,
-        use_rerank=True,
-    ),
-    # Attempt 3: Maximum recall configuration with RSE
+    # Attempt 2: Maximum recall with RSE (paper configuration)
     RetrievalStrategy(
         pipeline_id="hybrid_filter_rerank",
         top_k=30,
@@ -77,6 +68,9 @@ class RetrievalAgent(BaseAgent):
         db=None,
         embedding_fn=None,
         reranker_model: str = None,
+        pipeline_id: str = "hybrid_filter_rerank",
+        base_top_k: int = 10,
+        base_initial_k_factor: float = 3.0,
         use_rule_router: bool = True,
         use_rse: bool = False,
         disable_escalation: bool = False,
@@ -88,6 +82,9 @@ class RetrievalAgent(BaseAgent):
             db: ChromaDB instance
             embedding_fn: Embedding function for HyDE
             reranker_model: Model name for reranking
+            pipeline_id: Canonical pipeline used by every retry attempt
+            base_top_k: Attempt-0 retrieval depth (later attempts add 10)
+            base_initial_k_factor: Attempt-0 candidate multiplier
             use_rule_router: Whether to use rule-based classification
             use_rse: Whether to use Relevant Segment Extraction
             disable_escalation: Ablation flag - always use attempt 0 strategy
@@ -97,6 +94,9 @@ class RetrievalAgent(BaseAgent):
         self.db = db
         self.embedding_fn = embedding_fn
         self.reranker_model = reranker_model
+        self.pipeline_id = pipeline_id
+        self.base_top_k = max(1, int(base_top_k))
+        self.base_initial_k_factor = max(1.0, float(base_initial_k_factor))
         self.use_rule_router = use_rule_router
         self.use_rse = use_rse
         self.disable_escalation = disable_escalation
@@ -140,13 +140,24 @@ class RetrievalAgent(BaseAgent):
         Returns:
             Dictionary of extracted features
         """
-        classification = self.classifier.classify(question)
+        # A fixed retry policy does not use the classification to select a
+        # pipeline. Avoid an otherwise wasted LLM call; optionally retain the
+        # free rule-based label for diagnostics.
+        if self.use_rule_router:
+            classification = self.classifier.classify(question)
+            question_type = classification.question_type
+            classification_confidence = classification.confidence
+            classification_reasoning = classification.reasoning
+        else:
+            question_type = "fixed-policy"
+            classification_confidence = 1.0
+            classification_reasoning = "No classifier call: strategy is fixed by configuration"
 
         # Extract additional features
         features = {
-            "question_type": classification.question_type,
-            "classification_confidence": classification.confidence,
-            "classification_reasoning": classification.reasoning,
+            "question_type": question_type,
+            "classification_confidence": classification_confidence,
+            "classification_reasoning": classification_reasoning,
             "has_company_name": self._detect_company_name(question),
             "has_fiscal_year": self._detect_fiscal_year(question),
             "has_numeric_ask": self._detect_numeric_ask(question),
@@ -208,7 +219,17 @@ class RetrievalAgent(BaseAgent):
         else:
             strategy_idx = min(attempt, len(ESCALATION_STRATEGIES) - 1)
 
-        strategy = ESCALATION_STRATEGIES[strategy_idx]
+        template = ESCALATION_STRATEGIES[strategy_idx]
+        factor_offsets = (0.0, 1.0, 3.0)
+        strategy = replace(
+            template,
+            pipeline_id=self.pipeline_id,
+            top_k=self.base_top_k + (10 * strategy_idx),
+            initial_k_factor=(
+                self.base_initial_k_factor + factor_offsets[strategy_idx]
+            ),
+            use_rerank=self.pipeline_id == "hybrid_filter_rerank",
+        )
 
         # Ablation: disable HyDE - override use_hyde to False
         if self.disable_hyde and strategy.use_hyde:
@@ -271,6 +292,7 @@ class RetrievalAgent(BaseAgent):
                 "top_k": strategy.top_k,
                 "initial_k_factor": strategy.initial_k_factor,
                 "use_hyde": strategy.use_hyde,
+                "use_rse": strategy.use_rse,
                 "use_rerank": strategy.use_rerank,
             },
             confidence=confidence,
@@ -303,6 +325,7 @@ class RetrievalAgent(BaseAgent):
 
         strategy_values = decision.decision_value
         top_k = strategy_values["top_k"]
+        initial_k_factor = strategy_values["initial_k_factor"]
 
         # Handle HyDE if enabled
         if strategy_values.get("use_hyde"):
@@ -311,22 +334,35 @@ class RetrievalAgent(BaseAgent):
         else:
             query = question
 
-        # Use pre-built pipeline if available
-        if self._pipeline is not None:
+        # Use an explicitly supplied pipeline, or build and cache the canonical
+        # hybrid pipeline declared by the strategy. The old agentic path fell
+        # through to semantic-only search and therefore never ran the pipeline
+        # described in the paper.
+        pipeline = self._pipeline or self._get_or_build_pipeline(
+            strategy_values["pipeline_id"],
+            top_k=top_k,
+            initial_k_factor=initial_k_factor,
+        )
+        if pipeline is not None:
             # Update top_k dynamically
-            if hasattr(self._pipeline, 'top_k'):
-                self._pipeline.top_k = top_k
+            if hasattr(pipeline, 'top_k'):
+                pipeline.top_k = top_k
+            if hasattr(pipeline, 'initial_k_factor'):
+                pipeline.initial_k_factor = initial_k_factor
 
             # Use RSE if enabled and pipeline supports it
-            if self.use_rse and hasattr(self._pipeline, 'retrieve_segments'):
-                segments = self._pipeline.retrieve_segments(query)
+            use_rse = self.use_rse or strategy_values.get("use_rse", False)
+            if use_rse and hasattr(pipeline, 'retrieve_segment_documents'):
+                return pipeline.retrieve_segment_documents(query)
+            if use_rse and hasattr(pipeline, 'retrieve_segments'):
+                segments = pipeline.retrieve_segments(query)
                 # Convert segments to Documents for downstream compatibility
                 return [
                     Document(page_content=seg, metadata={"source": "RSE segment", "segment_idx": i})
                     for i, seg in enumerate(segments)
                 ] if segments else []
 
-            return self._pipeline.retrieve(query)
+            return pipeline.retrieve(query)
 
         # Extract metadata from question for filtering
         # This ensures company-specific queries (e.g., "AMD revenue FY22") retrieve
@@ -342,10 +378,10 @@ class RetrievalAgent(BaseAgent):
             filter_conditions = []
             # Normalize company names to match ChromaDB format (uppercase, no spaces)
             # ChromaDB stores: "BESTBUY", "AMERICANWATERWORKS", "COCACOLA" etc.
-            normalized_companies = [
-                c.upper().replace(" ", "").replace("-", "").replace("&", "AND")
-                for c in companies
-            ]
+            from src.metadata_utils import normalize_company_name
+            normalized_companies = sorted({
+                normalize_company_name(c) for c in companies
+            })
             if len(normalized_companies) == 1:
                 filter_conditions.append({"company": normalized_companies[0]})
             else:
@@ -403,6 +439,42 @@ class RetrievalAgent(BaseAgent):
             docs = reranker.rerank(question, docs, top_k)
 
         return docs
+
+    def _get_or_build_pipeline(
+        self,
+        pipeline_id: str,
+        top_k: int,
+        initial_k_factor: float,
+    ):
+        """Build a canonical retrieval pipeline once and reuse it on retries."""
+
+        if self.db is None:
+            return None
+
+        cache_key = (pipeline_id, self.reranker_model)
+        if cache_key not in self._pipeline_cache:
+            from src.retrieval_tools.tool_registry import (
+                build_pipeline,
+                build_retriever_for_pipeline,
+            )
+
+            retriever, set_k_fn, take_top_k_fn, use_hybrid = (
+                build_retriever_for_pipeline(pipeline_id, self.db, top_k)
+            )
+            self._pipeline_cache[cache_key] = build_pipeline(
+                pipeline_id=pipeline_id,
+                retriever=retriever,
+                top_k=top_k,
+                initial_k_factor=initial_k_factor,
+                set_k_fn=set_k_fn,
+                take_top_k_fn=take_top_k_fn,
+                reranker_model=self.reranker_model,
+                use_rse=False,
+                db=self.db,
+                use_hybrid=use_hybrid,
+            )
+
+        return self._pipeline_cache[cache_key]
 
     def set_pipeline(self, pipeline) -> None:
         """Set a pre-built pipeline to use for retrieval.

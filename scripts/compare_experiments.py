@@ -22,16 +22,15 @@ import argparse
 import json
 import sys
 from pathlib import Path
-from typing import Dict, List, Any, Optional
+from typing import Any, Dict, List
 
 import pandas as pd
-import numpy as np
 
 # Add parent to path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from evaluation.metrics import bootstrap_compare, bootstrap_ci
-from evaluation.latex_tables import significance_marker, generate_results_table
+from evaluation.metrics import bootstrap_compare
+from evaluation.latex_tables import significance_marker
 
 
 def load_results(path: Path) -> pd.DataFrame:

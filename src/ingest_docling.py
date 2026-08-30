@@ -20,7 +20,6 @@ import sys
 import time
 from pathlib import Path
 from typing import List, Optional
-from concurrent.futures import ProcessPoolExecutor, as_completed
 
 # Try to import torch for GPU memory management
 try:
@@ -38,6 +37,16 @@ from langchain_chroma import Chroma
 
 from src.config import get_embedding_model, DEFAULTS
 from src.metadata_utils import parse_filename
+
+
+def add_chunk_identity(chunks: List[Document], source_file: str) -> List[Document]:
+    """Attach stable source-local ordering and identity to parsed chunks."""
+
+    source_stem = Path(source_file).stem
+    for index, chunk in enumerate(chunks):
+        chunk.metadata["chunk_index"] = index
+        chunk.metadata["chunk_id"] = f"{source_stem}:chunk:{index:05d}"
+    return chunks
 
 
 def cleanup_memory():
@@ -149,7 +158,7 @@ def process_pdf_docling(pdf_path: Path, chunk_size: int = 2500) -> List[Document
             metadata={**file_meta_dict, 'element_type': current_type, 'source': str(pdf_path)}
         ))
 
-    return chunks
+    return add_chunk_identity(chunks, pdf_path.name)
 
 
 def get_processed_files(chroma_path: str) -> set:

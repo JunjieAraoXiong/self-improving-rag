@@ -1,7 +1,7 @@
 """Central configuration for RAG system."""
 
 import os
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Dict, List, Optional
 from dotenv import load_dotenv
 
@@ -644,7 +644,7 @@ class Defaults:
     judge_model: str = "gpt-4o-mini"  # Was claude-sonnet-4-5-20250514 (404 error)
 
     # Retrieval defaults
-    top_k: int = 5
+    top_k: int = 10
     initial_k_factor: float = 3.0
     pipeline_id: str = "hybrid_filter_rerank"
     ensemble_weights: tuple = (0.5, 0.5)  # (BM25, semantic) - balanced for entity + semantic matching
@@ -652,7 +652,10 @@ class Defaults:
 
     # Generation defaults
     temperature: float = 0.0
-    max_tokens: int = 512
+    # Typed finance programs include a strict contract, operands, provenance,
+    # and an expression tree. 512 output tokens truncates even small valid
+    # programs, so keep enough headroom for exact evidence quotes.
+    max_tokens: int = 4096
 
     # Router defaults
     router_classifier_model: str = "gpt-4o-mini"

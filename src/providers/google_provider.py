@@ -1,15 +1,23 @@
 """Google Gemini provider."""
 
-from .base import LLMProvider, LLMResponse
+from typing import Optional
+
+from .base import LLMProvider, LLMResponse, package_version
 
 
 class GoogleProvider(LLMProvider):
     """Provider for Google Gemini models."""
 
     def _create_client(self):
-        import google.generativeai as genai
-        genai.configure(api_key=self.api_key)
-        return genai.GenerativeModel(self.model_name)
+        from google import genai
+
+        return genai.Client(api_key=self.api_key)
+
+    @property
+    def supports_seed(self) -> bool:
+        """The current Google Gen AI SDK accepts best-effort request seeds."""
+
+        return True
 
     def generate(
         self,
@@ -17,28 +25,20 @@ class GoogleProvider(LLMProvider):
         user_prompt: str,
         max_tokens: int = 512,
         temperature: float = 0.0,
+        seed: Optional[int] = None,
     ) -> LLMResponse:
-        import google.generativeai as genai
-        from google.generativeai.types import HarmCategory, HarmBlockThreshold
-
-        # Gemini combines system and user prompts
-        full_prompt = f"{system_prompt}\n\n{user_prompt}"
-
-        # Lower safety settings for medical/scientific content
-        safety_settings = {
-            HarmCategory.HARM_CATEGORY_HARASSMENT: HarmBlockThreshold.BLOCK_NONE,
-            HarmCategory.HARM_CATEGORY_HATE_SPEECH: HarmBlockThreshold.BLOCK_NONE,
-            HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT: HarmBlockThreshold.BLOCK_NONE,
-            HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT: HarmBlockThreshold.BLOCK_NONE,
+        generation_config = {
+            "system_instruction": system_prompt,
+            "max_output_tokens": max_tokens,
+            "temperature": temperature,
         }
+        if seed is not None:
+            generation_config["seed"] = seed
 
-        response = self.client.generate_content(
-            full_prompt,
-            generation_config={
-                "max_output_tokens": max_tokens,
-                "temperature": temperature,
-            },
-            safety_settings=safety_settings,
+        response = self.client.models.generate_content(
+            model=self.model_name,
+            contents=user_prompt,
+            config=generation_config,
         )
 
         content = ""
@@ -53,16 +53,32 @@ class GoogleProvider(LLMProvider):
                 "total_tokens": response.usage_metadata.total_token_count,
             }
 
+        metadata = self.request_metadata(
+            temperature=temperature,
+            max_tokens=max_tokens,
+            seed=seed,
+            seed_applied=seed is not None,
+            response_model=getattr(response, "model_version", None),
+            request_id=getattr(response, "response_id", None),
+            sdk="google-genai",
+            sdk_version=package_version("google-genai"),
+        )
         response_obj = LLMResponse(
             content=content,
             model=self.model_name,
             provider="google",
             usage=usage,
+            metadata=metadata,
         )
 
         # Record usage in global tracker
         from .base import get_usage_tracker
-        get_usage_tracker().record(usage)
+        get_usage_tracker().record(
+            usage,
+            model=self.model_name,
+            provider="google",
+            request_metadata=metadata,
+        )
 
         return response_obj
 

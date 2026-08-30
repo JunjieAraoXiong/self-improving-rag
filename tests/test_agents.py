@@ -11,7 +11,6 @@ Usage:
     pytest tests/test_agents.py -v      # Verbose output
 """
 
-import pytest
 from datetime import datetime
 
 
@@ -208,6 +207,56 @@ class TestJudgeAgentLogic:
         # Attempt 1: threshold = 0.4
         assert judge.should_retry(0.45, attempt=1, max_retries=3) is False
 
+    def test_v2_threshold_does_not_decay_with_retry_count(self):
+        """A correction attempt must not lower the quality bar."""
+        from src.agents.judge_agent import JudgeAgent
+
+        judge = JudgeAgent(
+            retry_threshold=0.5,
+            min_threshold=0.2,
+            threshold_decay=0.0,
+            enable_deterministic_gate=False,
+        )
+
+        assert judge.acceptance_threshold(0) == 0.5
+        assert judge.acceptance_threshold(3) == 0.5
+        assert judge.should_retry(0.45, attempt=1, max_retries=3) is True
+
+    def test_significant_improvement_does_not_bypass_policy_threshold(self):
+        from src.agents.judge_agent import JudgeAgent
+
+        judge = JudgeAgent(
+            retry_threshold=0.5,
+            min_threshold=0.3,
+            enable_deterministic_gate=False,
+        )
+        judge._attempt_scores = [0.1]
+
+        assert judge.should_retry(0.31, attempt=1, max_retries=3) is True
+
+    def test_relaxed_threshold_is_reported_as_policy_acceptance(self):
+        from src.agents.judge_agent import JudgeAgent
+
+        judge = JudgeAgent(
+            retry_threshold=0.5,
+            min_threshold=0.3,
+            enable_deterministic_gate=False,
+        )
+        judge.evaluate = lambda *args, **kwargs: (0.45, "test")
+
+        decision = judge.decide(
+            {
+                "question": "Question?",
+                "predicted_answer": "Answer",
+                "attempt": 1,
+                "max_retries": 2,
+            }
+        )
+
+        assert decision.decision_value["retry"] is False
+        assert decision.decision_value["pass"] is True
+        assert decision.decision_value["acceptance_threshold"] == 0.4
+
     def test_judge_reset(self):
         """Test judge reset clears attempt scores."""
         from src.agents.judge_agent import JudgeAgent
@@ -248,7 +297,7 @@ class TestJudgeAgentDecision:
 
         # Mock the evaluate method to return a high score
         original_evaluate = judge.evaluate
-        judge.evaluate = lambda q, a, g: (0.9, "Good answer")
+        judge.evaluate = lambda q, a, g, docs=None: (0.9, "Good answer")
 
         try:
             decision = judge.decide({
@@ -275,7 +324,7 @@ class TestJudgeAgentDecision:
         )
 
         # Mock low score
-        judge.evaluate = lambda q, a, g: (0.2, "Poor answer")
+        judge.evaluate = lambda q, a, g, docs=None: (0.2, "Poor answer")
 
         decision = judge.decide({
             "question": "What is X?",

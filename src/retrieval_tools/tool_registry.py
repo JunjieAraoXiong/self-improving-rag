@@ -1,6 +1,6 @@
 """Registry for retrieval pipelines/policies."""
 
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple
 from langchain_core.documents import Document
 
 from .base import RetrievalPipeline
@@ -11,6 +11,7 @@ from .rerank import get_reranker
 from .rse import extract_relevant_segments
 from src.config import DEFAULTS
 from src.metadata_utils import extract_metadata_from_question
+from src.metadata_utils import normalize_company_name
 
 
 def _build_chroma_filter(metadata: Dict[str, Any]) -> Optional[Dict[str, Any]]:
@@ -33,11 +34,13 @@ def _build_chroma_filter(metadata: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     # Build filter conditions
     conditions = []
 
-    # Company filter (case-insensitive matching via uppercase)
+    canonical_companies = sorted({normalize_company_name(c) for c in companies})
+
+    # Company filter uses the exact key written by ingestion.
     if len(companies) == 1:
-        conditions.append({"company": companies[0].upper()})
+        conditions.append({"company": canonical_companies[0]})
     else:
-        conditions.append({"company": {"$in": [c.upper() for c in companies]}})
+        conditions.append({"company": {"$in": canonical_companies}})
 
     # Year filter
     if len(years) == 1:
@@ -112,7 +115,11 @@ class SimplePipeline(RetrievalPipeline):
                 )
             self._filtered_retriever_cache[cache_key] = retriever
 
-        return self._filtered_retriever_cache[cache_key]
+        # Retry escalation changes initial_k. Cached filtered retrievers must be
+        # updated too; otherwise company+year questions stay at attempt-0 recall.
+        retriever = self._filtered_retriever_cache[cache_key]
+        self._set_k(retriever, k)
+        return retriever
 
     def retrieve(self, question: str) -> List[Document]:
         """Retrieve documents for a question.
@@ -132,11 +139,22 @@ class SimplePipeline(RetrievalPipeline):
                 try:
                     retriever = self._get_filtered_retriever(chroma_filter, initial_k)
                     docs = retriever.invoke(question)
-                    use_prefilter = True
+                    use_prefilter = bool(docs)
                     if docs:
                         print(f"✓ Pre-filter: {len(docs)} docs for {metadata.get('companies')} {metadata.get('years')}")
+                    else:
+                        print(
+                            "⚠️ Pre-filter returned no documents; using "
+                            "strict post-filter"
+                        )
                 except Exception as e:
-                    print(f"⚠️ Pre-filter failed: {e}, falling back to standard retrieval")
+                    # Some legacy indexes lack metadata for 8-K/earnings files.
+                    # Fall back to broad retrieval, then apply the strict
+                    # fail-closed post-filter below.
+                    print(
+                        "⚠️ Pre-filter unavailable; using strict post-filter: "
+                        f"{e}"
+                    )
                     use_prefilter = False
 
         # Fall back to standard retrieval if pre-filtering wasn't used
@@ -181,6 +199,44 @@ class SimplePipeline(RetrievalPipeline):
             relevance_scores=relevance_scores,
             preset=self.rse_preset,
         )
+
+    def retrieve_segment_documents(self, question: str) -> List[Document]:
+        """Retrieve RSE segments while preserving source provenance."""
+
+        from .rse import extract_segments_with_metadata
+
+        docs = self.retrieve(question)
+        if not docs:
+            return []
+        relevance_scores = [
+            doc.metadata.get("rerank_score", 1.0 / (index + 1))
+            for index, doc in enumerate(docs)
+        ]
+        segments = extract_segments_with_metadata(
+            docs,
+            relevance_scores=relevance_scores,
+            preset=self.rse_preset,
+        )
+        result = []
+        for index, segment in enumerate(segments):
+            child_ids = [
+                child.metadata.get("chunk_id", child.metadata.get("chunk_index"))
+                for child in segment["chunks"]
+            ]
+            result.append(
+                Document(
+                    page_content=segment["text"],
+                    metadata={
+                        "source": segment["source"],
+                        "positions": segment["positions"],
+                        "num_chunks": segment["num_chunks"],
+                        "rse_value": segment["total_value"],
+                        "child_chunk_ids": child_ids,
+                        "segment_idx": index,
+                    },
+                )
+            )
+        return result
 
 
 def _pipeline_flags(pipeline_id: str) -> Tuple[bool, bool, bool]:
@@ -265,4 +321,4 @@ def list_pipelines() -> List[str]:
 
 
 # Re-export routed pipeline builder for convenience
-from .router import build_routed_pipeline
+from .router import build_routed_pipeline  # noqa: E402,F401

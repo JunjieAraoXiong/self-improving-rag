@@ -1,8 +1,89 @@
 """Evaluation metrics for RAG system."""
 
+import json
 from typing import Dict, Any, Optional, List, Tuple
 import numpy as np
 import pandas as pd
+
+
+def _coerce_binary_series(values: pd.Series, field_name: str) -> pd.Series:
+    """Parse nullable booleans without treating the string ``False`` as true."""
+
+    parsed = {}
+    for index, raw in values.dropna().items():
+        if isinstance(raw, (bool, np.bool_)):
+            parsed[index] = float(bool(raw))
+            continue
+        if isinstance(raw, (int, float, np.integer, np.floating)) and raw in (0, 1):
+            parsed[index] = float(raw)
+            continue
+        if isinstance(raw, str):
+            normalized = raw.strip().lower()
+            if normalized in {"true", "t", "yes", "y", "1"}:
+                parsed[index] = 1.0
+                continue
+            if normalized in {"false", "f", "no", "n", "0"}:
+                parsed[index] = 0.0
+                continue
+        raise ValueError(f"Unrecognized boolean value in {field_name}: {raw!r}")
+    return pd.Series(parsed, dtype=float)
+
+
+def _error_mask(values: pd.Series) -> pd.Series:
+    """Return a boolean mask for non-empty terminal error values."""
+
+    def is_error(raw: Any) -> bool:
+        if raw is None:
+            return False
+        try:
+            if pd.isna(raw):
+                return False
+        except (TypeError, ValueError):
+            pass
+        if isinstance(raw, str):
+            return bool(raw.strip())
+        return bool(raw)
+
+    return values.map(is_error).astype(bool)
+
+
+def _judge_correctness_thresholds(
+    results_df: pd.DataFrame,
+    indices: pd.Index,
+) -> pd.Series:
+    """Return the correctness threshold associated with each Judge score.
+
+    New artifacts persist ``outcome_judge_threshold`` explicitly. For legacy
+    rows, post-selection evaluation defaults to the current full-credit 0.99
+    rule while historical oracle/policy scores retain their old 0.5 boundary.
+    """
+
+    thresholds = pd.Series(np.nan, index=indices, dtype=float)
+    if 'outcome_judge_threshold' in results_df.columns:
+        persisted = pd.to_numeric(
+            results_df.loc[indices, 'outcome_judge_threshold'],
+            errors='coerce',
+        )
+        invalid = persisted.dropna()[(persisted.dropna() < 0.0) | (persisted.dropna() > 1.0)]
+        if len(invalid):
+            raise ValueError("outcome_judge_threshold must be between 0 and 1")
+        thresholds.loc[persisted.index] = persisted
+
+    for index in indices:
+        if not pd.isna(thresholds.loc[index]):
+            continue
+        mode = (
+            str(results_df.at[index, 'evaluation_mode'])
+            if 'evaluation_mode' in results_df.columns
+            and not pd.isna(results_df.at[index, 'evaluation_mode'])
+            else ''
+        )
+        thresholds.loc[index] = (
+            0.99
+            if mode.startswith(('post_selection_', 'terminal_', 'evaluator_'))
+            else 0.5
+        )
+    return thresholds
 
 
 def bootstrap_ci(
@@ -220,6 +301,41 @@ def pass_at_k(
     return passes / len(scores)
 
 
+def _has_retrieved_evidence(row: Dict[str, Any]) -> bool:
+    """Recognize retrieval evidence across standard and agentic result schemas."""
+
+    count = row.get("retrieved_document_count")
+    try:
+        if count is not None and float(count) > 0:
+            return True
+    except (TypeError, ValueError):
+        pass
+
+    for field_name in ("sources", "evidence_manifest"):
+        value = row.get(field_name)
+        if value is None:
+            continue
+        if isinstance(value, str):
+            value = value.strip()
+            if not value:
+                continue
+            try:
+                value = json.loads(value)
+            except json.JSONDecodeError:
+                # Legacy ``sources`` may be a plain source name rather than JSON.
+                if field_name == "sources":
+                    return True
+                continue
+        if isinstance(value, (dict, list, tuple, set)):
+            if value:
+                return True
+            continue
+        if not pd.isna(value) and bool(value):
+            return True
+
+    return False
+
+
 def categorize_failure(row: Dict[str, Any]) -> str:
     """Categorize why a question failed to get a good answer.
 
@@ -240,8 +356,9 @@ def categorize_failure(row: Dict[str, Any]) -> str:
     if row.get('error'):
         return 'error'
 
-    # Check for empty retrieval
-    if not row.get('sources'):
+    # Standard results expose ``sources``; agentic results persist an evidence
+    # manifest or an explicit document count instead.
+    if not _has_retrieved_evidence(row):
         return 'retrieval_empty'
 
     # Check for numeric hallucination
@@ -360,27 +477,137 @@ def calculate_aggregate_metrics(results_df: pd.DataFrame) -> Dict[str, Any]:
                 'min': 0.0, 'max': 0.0, 'count': 0
             }
 
-    # LLM judge scores if available
+    # New result files use this for a post-selection evaluator; older files may
+    # contain a policy signal. Keep generic score statistics and use
+    # evaluation_mode/correct to distinguish their semantics.
     if 'judge_score' in results_df.columns:
-        judge_values = results_df['judge_score'].dropna()
+        judge_values = pd.to_numeric(
+            results_df['judge_score'], errors='coerce'
+        ).dropna()
         if len(judge_values) > 0:
             judge_list = judge_values.tolist()
             mean, ci_lower, ci_upper = bootstrap_ci(judge_list)
-            accuracy = float((judge_values >= 0.5).mean())
-            pass_rate = pass_at_k(judge_list, threshold=0.5)
+            thresholds = _judge_correctness_thresholds(
+                results_df, judge_values.index
+            )
+            full_credit = (judge_values >= thresholds).astype(float)
+            full_mean, full_lower, full_upper = bootstrap_ci(
+                full_credit.tolist()
+            )
             metrics['judge_score'] = {
                 'mean': mean,
                 'ci_95': [ci_lower, ci_upper],
                 'std': float(judge_values.std()),
-                'accuracy': accuracy,
-                'pass_at_1': pass_rate,
+                'threshold_pass_rate': full_mean,
+                'threshold_pass_rate_ci_95': [full_lower, full_upper],
+                'correctness_thresholds': sorted(set(thresholds.tolist())),
+                'partial_credit_rate_at_0_5': float(
+                    (judge_values >= 0.5).mean()
+                ),
                 'count': int(len(judge_values)),
             }
         else:
             metrics['judge_score'] = {
                 'mean': 0.0, 'ci_95': [0.0, 0.0], 'std': 0.0,
-                'accuracy': 0.0, 'pass_at_1': 0.0, 'count': 0
+                'threshold_pass_rate': 0.0,
+                'threshold_pass_rate_ci_95': [0.0, 0.0],
+                'correctness_thresholds': [],
+                'partial_credit_rate_at_0_5': 0.0,
+                'count': 0,
             }
+
+    if 'policy_accepted' in results_df.columns:
+        accepted = _coerce_binary_series(
+            results_df['policy_accepted'], 'policy_accepted'
+        )
+        if len(accepted) > 0:
+            mean, ci_lower, ci_upper = bootstrap_ci(accepted.tolist())
+            metrics['policy_acceptance'] = {
+                'rate': mean,
+                'ci_95': [ci_lower, ci_upper],
+                'count': int(len(accepted)),
+            }
+
+    if 'correct' in results_df.columns:
+        correctness = _coerce_binary_series(results_df['correct'], 'correct')
+        if len(correctness) > 0:
+            mean, ci_lower, ci_upper = bootstrap_ci(correctness.tolist())
+            modes = set(results_df.loc[correctness.index, 'evaluation_mode'].dropna()) \
+                if 'evaluation_mode' in results_df.columns else set()
+            label = (
+                'oracle-guided fixed-threshold correctness-label rate'
+                if modes == {'oracle_guided'}
+                else (
+                    'post-selection correctness-label rate'
+                    if modes and all(
+                        str(mode).startswith(('post_selection_', 'terminal_'))
+                        for mode in modes
+                    )
+                    else 'provided correctness-label rate'
+                )
+            )
+            metrics['labeled_correctness'] = {
+                'rate': mean,
+                'ci_95': [ci_lower, ci_upper],
+                'count': int(len(correctness)),
+                'label': label,
+            }
+
+    if 'abstained' in results_df.columns or 'error' in results_df.columns:
+        total_count = len(results_df)
+        abstained = pd.Series(0.0, index=results_df.index, dtype=float)
+        if 'abstained' in results_df.columns:
+            abstained = _coerce_binary_series(
+                results_df['abstained'], 'abstained'
+            ).reindex(results_df.index).fillna(0.0)
+        errors = pd.Series(False, index=results_df.index, dtype=bool)
+        if 'error' in results_df.columns:
+            errors = _error_mask(results_df['error']).reindex(
+                results_df.index, fill_value=False
+            )
+
+        # Terminal errors take precedence if a malformed row marks both states.
+        abstention_mask = (abstained == 1.0) & ~errors
+        covered_mask = ~errors & ~abstention_mask
+        answered_index = results_df.index[covered_mask]
+        covered_count = int(covered_mask.sum())
+        abstention_count = int(abstention_mask.sum())
+        error_count = int(errors.sum())
+        noncoverage_count = total_count - covered_count
+        coverage = covered_count / total_count if total_count else 0.0
+        selective = None
+        selective_count = 0
+        if 'correct' in results_df.columns:
+            correctness = _coerce_binary_series(results_df['correct'], 'correct')
+            selective_values = correctness.reindex(answered_index).dropna()
+            selective_count = int(len(selective_values))
+            if selective_count:
+                selective = float(selective_values.mean())
+        metrics['selective_prediction'] = {
+            'coverage': float(coverage),
+            'noncoverage_rate': (
+                float(noncoverage_count / total_count) if total_count else 0.0
+            ),
+            'abstention_rate': (
+                float(abstention_count / total_count) if total_count else 0.0
+            ),
+            'error_rate': (
+                float(error_count / total_count) if total_count else 0.0
+            ),
+            'selective_accuracy': selective,
+            'selective_risk': (
+                float(1.0 - selective) if selective is not None else None
+            ),
+            'answered_evaluated_count': selective_count,
+            'covered_question_count': covered_count,
+            'abstention_count': abstention_count,
+            'error_count': error_count,
+            'noncoverage_count': noncoverage_count,
+            'total_question_count': int(total_count),
+            # Kept for readers of older summaries; eligibility now means every
+            # requested question rather than only error-free rows.
+            'eligible_question_count': int(total_count),
+        }
 
     # Per question type breakdown with bootstrap CIs
     # Minimum samples required for meaningful CI (too few samples = unreliable CI)
@@ -419,38 +646,71 @@ def calculate_aggregate_metrics(results_df: pd.DataFrame) -> Dict[str, Any]:
                     }
 
             if 'judge_score' in type_df.columns:
-                judge_vals = type_df['judge_score'].dropna()
+                judge_vals = pd.to_numeric(
+                    type_df['judge_score'], errors='coerce'
+                ).dropna()
                 n_samples = len(judge_vals)
-                accuracy = float((judge_vals >= 0.5).mean()) if n_samples > 0 else 0.0
+                thresholds = _judge_correctness_thresholds(
+                    results_df, judge_vals.index
+                )
+                binary_scores = (
+                    (judge_vals >= thresholds).astype(float).tolist()
+                )
+                threshold_pass_rate = (
+                    float(np.mean(binary_scores)) if binary_scores else 0.0
+                )
+                partial_credit_rate = (
+                    float((judge_vals >= 0.5).mean()) if n_samples else 0.0
+                )
 
                 if n_samples >= MIN_SAMPLES_FOR_CI:
                     mean, ci_lower, ci_upper = bootstrap_ci(judge_vals.tolist())
-                    # Also compute CI for accuracy (binary pass/fail)
-                    binary_scores = [1.0 if s >= 0.5 else 0.0 for s in judge_vals]
-                    acc_mean, acc_lower, acc_upper = bootstrap_ci(binary_scores)
+                    pass_mean, pass_lower, pass_upper = bootstrap_ci(binary_scores)
                     type_metrics['judge_score'] = {
                         'mean': mean,
                         'ci_95': [ci_lower, ci_upper],
-                        'accuracy': acc_mean,
-                        'accuracy_ci_95': [acc_lower, acc_upper],
+                        'threshold_pass_rate': pass_mean,
+                        'threshold_pass_rate_ci_95': [pass_lower, pass_upper],
+                        'correctness_thresholds': sorted(
+                            set(thresholds.tolist())
+                        ),
+                        'partial_credit_rate_at_0_5': partial_credit_rate,
                         'count': n_samples
                     }
                 elif n_samples > 0:
                     type_metrics['judge_score'] = {
                         'mean': float(judge_vals.mean()),
                         'ci_95': None,
-                        'accuracy': accuracy,
-                        'accuracy_ci_95': None,
+                        'threshold_pass_rate': threshold_pass_rate,
+                        'threshold_pass_rate_ci_95': None,
+                        'correctness_thresholds': sorted(
+                            set(thresholds.tolist())
+                        ),
+                        'partial_credit_rate_at_0_5': partial_credit_rate,
                         'count': n_samples
                     }
                 else:
                     type_metrics['judge_score'] = {
                         'mean': 0.0,
                         'ci_95': None,
-                        'accuracy': 0.0,
-                        'accuracy_ci_95': None,
+                        'threshold_pass_rate': 0.0,
+                        'threshold_pass_rate_ci_95': None,
+                        'correctness_thresholds': [],
+                        'partial_credit_rate_at_0_5': 0.0,
                         'count': 0
                     }
+
+            if 'policy_accepted' in type_df.columns:
+                accepted = _coerce_binary_series(
+                    type_df['policy_accepted'], 'policy_accepted'
+                )
+                if len(accepted) > 0:
+                    type_metrics['policy_acceptance_rate'] = float(accepted.mean())
+
+            if 'correct' in type_df.columns:
+                correctness = _coerce_binary_series(type_df['correct'], 'correct')
+                if len(correctness) > 0:
+                    type_metrics['labeled_correctness_rate'] = float(correctness.mean())
 
             metrics['by_question_type'][str(q_type)] = type_metrics
 
@@ -473,7 +733,7 @@ def calculate_aggregate_metrics(results_df: pd.DataFrame) -> Dict[str, Any]:
 
     # Error rate
     if 'error' in results_df.columns:
-        error_count = results_df['error'].notna().sum()
+        error_count = int(_error_mask(results_df['error']).sum())
         metrics['error_rate'] = float(error_count / len(results_df)) if len(results_df) > 0 else 0.0
 
     # Numeric verification metrics (hallucination check against sources)
@@ -526,7 +786,7 @@ def format_metrics_summary(metrics: Dict[str, Any]) -> str:
     # Overall semantic similarity
     if 'semantic_similarity' in metrics:
         sim = metrics['semantic_similarity']
-        lines.append(f"\nSemantic Similarity:")
+        lines.append("\nSemantic Similarity:")
         lines.append(f"  Mean:  {sim['mean']:.4f}")
         if 'ci_95' in sim:
             ci = sim['ci_95']
@@ -538,19 +798,59 @@ def format_metrics_summary(metrics: Dict[str, Any]) -> str:
     # LLM Judge scores
     if 'judge_score' in metrics:
         judge = metrics['judge_score']
-        lines.append(f"\nLLM Judge:")
+        lines.append("\nLLM Judge:")
         lines.append(f"  Mean Score: {judge['mean']:.4f}")
         if 'ci_95' in judge:
             ci = judge['ci_95']
             lines.append(f"  95% CI:     [{ci[0]:.4f}, {ci[1]:.4f}]")
-        lines.append(f"  Accuracy:   {judge['accuracy']:.2%}")
-        if 'pass_at_1' in judge:
-            lines.append(f"  Pass@1:     {judge['pass_at_1']:.2%}")
+        thresholds = judge.get('correctness_thresholds', [])
+        threshold_label = ", ".join(f"{value:g}" for value in thresholds)
+        lines.append(
+            f"  Full-credit Rate: {judge['threshold_pass_rate']:.2%} "
+            f"(thresholds: {threshold_label or 'not available'})"
+        )
+        lines.append(
+            "  Partial-credit >=0.5: "
+            f"{judge.get('partial_credit_rate_at_0_5', 0.0):.2%}"
+        )
         lines.append(f"  Count:      {judge['count']}")
+
+    if 'policy_acceptance' in metrics:
+        acceptance = metrics['policy_acceptance']
+        lines.append("\nPolicy Acceptance:")
+        lines.append(f"  Rate:  {acceptance['rate']:.2%}")
+        lines.append(
+            f"  95% CI: [{acceptance['ci_95'][0]:.2%}, "
+            f"{acceptance['ci_95'][1]:.2%}]"
+        )
+        lines.append(f"  Count: {acceptance['count']}")
+
+    if 'labeled_correctness' in metrics:
+        correctness = metrics['labeled_correctness']
+        lines.append(f"\nCorrectness label ({correctness['label']}):")
+        lines.append(f"  Rate:  {correctness['rate']:.2%}")
+        lines.append(
+            f"  95% CI: [{correctness['ci_95'][0]:.2%}, "
+            f"{correctness['ci_95'][1]:.2%}]"
+        )
+        lines.append(f"  Count: {correctness['count']}")
+
+    if 'selective_prediction' in metrics:
+        selective = metrics['selective_prediction']
+        lines.append("\nSelective Prediction:")
+        lines.append(f"  Coverage:        {selective['coverage']:.2%}")
+        lines.append(f"  Noncoverage:     {selective['noncoverage_rate']:.2%}")
+        lines.append(f"  Abstention rate: {selective['abstention_rate']:.2%}")
+        lines.append(f"  Terminal errors: {selective['error_rate']:.2%}")
+        if selective['selective_accuracy'] is not None:
+            lines.append(
+                f"  Selective accuracy: {selective['selective_accuracy']:.2%}"
+            )
+            lines.append(f"  Selective risk:     {selective['selective_risk']:.2%}")
 
     # Per question type (with CIs when available)
     if 'by_question_type' in metrics and metrics['by_question_type']:
-        lines.append(f"\nBy Question Type:")
+        lines.append("\nBy Question Type:")
         for q_type, type_metrics in metrics['by_question_type'].items():
             lines.append(f"  {q_type}:")
 
@@ -584,13 +884,18 @@ def format_metrics_summary(metrics: Dict[str, Any]) -> str:
                         lines.append(f"    Judge Score:  {mean_str} [{ci[0]:.3f}, {ci[1]:.3f}]")
                     else:
                         lines.append(f"    Judge Score:  {mean_str} (n<5, no CI)")
-                    if judge.get('accuracy') is not None:
-                        acc_str = f"{judge['accuracy']:.2%}"
-                        if judge.get('accuracy_ci_95'):
-                            acc_ci = judge['accuracy_ci_95']
-                            lines.append(f"    Accuracy:     {acc_str} [{acc_ci[0]:.1%}, {acc_ci[1]:.1%}]")
+                    if judge.get('threshold_pass_rate') is not None:
+                        pass_str = f"{judge['threshold_pass_rate']:.2%}"
+                        if judge.get('threshold_pass_rate_ci_95'):
+                            pass_ci = judge['threshold_pass_rate_ci_95']
+                            lines.append(f"    Full credit:  {pass_str} [{pass_ci[0]:.1%}, {pass_ci[1]:.1%}]")
                         else:
-                            lines.append(f"    Accuracy:     {acc_str}")
+                            lines.append(f"    Full credit:  {pass_str}")
+                    if judge.get('partial_credit_rate_at_0_5') is not None:
+                        lines.append(
+                            "    Partial >=.5: "
+                            f"{judge['partial_credit_rate_at_0_5']:.2%}"
+                        )
                 else:
                     # Legacy format fallback
                     lines.append(f"    Judge Score:  {judge:.4f}")
@@ -599,17 +904,27 @@ def format_metrics_summary(metrics: Dict[str, Any]) -> str:
             elif 'judge_score_mean' in type_metrics:
                 lines.append(f"    Judge Score:  {type_metrics['judge_score_mean']:.4f}")
                 if 'judge_accuracy' in type_metrics:
-                    lines.append(f"    Accuracy:     {type_metrics['judge_accuracy']:.2%}")
+                    lines.append(f"    Legacy judge pass: {type_metrics['judge_accuracy']:.2%}")
+
+            if 'policy_acceptance_rate' in type_metrics:
+                lines.append(
+                    f"    Policy accepted: {type_metrics['policy_acceptance_rate']:.2%}"
+                )
+            if 'labeled_correctness_rate' in type_metrics:
+                lines.append(
+                    "    Correctness label: "
+                    f"{type_metrics['labeled_correctness_rate']:.2%}"
+                )
 
     # Timing
     if 'retrieval_time_ms' in metrics:
         ret = metrics['retrieval_time_ms']
-        lines.append(f"\nRetrieval Latency (ms):")
+        lines.append("\nRetrieval Latency (ms):")
         lines.append(f"  Mean: {ret['mean']:.1f}  P50: {ret['p50']:.1f}  P95: {ret['p95']:.1f}")
 
     if 'generation_time_ms' in metrics:
         gen = metrics['generation_time_ms']
-        lines.append(f"\nGeneration Latency (ms):")
+        lines.append("\nGeneration Latency (ms):")
         lines.append(f"  Mean: {gen['mean']:.1f}  P50: {gen['p50']:.1f}  P95: {gen['p95']:.1f}")
 
     # Error rate
@@ -619,7 +934,7 @@ def format_metrics_summary(metrics: Dict[str, Any]) -> str:
     # Numeric verification (hallucination check)
     if 'numeric_verification' in metrics:
         num = metrics['numeric_verification']
-        lines.append(f"\nNumeric Verification (vs Sources):")
+        lines.append("\nNumeric Verification (vs Sources):")
         lines.append(f"  Mean Score:        {num['mean']:.4f}")
         lines.append(f"  Hallucination Rate: {num['hallucination_rate']:.2%}")
         lines.append(f"  Perfect Rate:      {num['perfect_rate']:.2%}")
@@ -628,7 +943,7 @@ def format_metrics_summary(metrics: Dict[str, Any]) -> str:
     # Numeric accuracy (exact-match against gold)
     if 'numeric_accuracy' in metrics:
         num_acc = metrics['numeric_accuracy']
-        lines.append(f"\nNumeric Accuracy (vs Gold Answer):")
+        lines.append("\nNumeric Accuracy (vs Gold Answer):")
         lines.append(f"  Exact Match Rate: {num_acc['exact_match_rate']:.2%}")
         if 'ci_95' in num_acc:
             ci = num_acc['ci_95']
@@ -638,7 +953,7 @@ def format_metrics_summary(metrics: Dict[str, Any]) -> str:
     # Failure breakdown
     if 'failure_breakdown' in metrics:
         fb = metrics['failure_breakdown']
-        lines.append(f"\nFailure Breakdown:")
+        lines.append("\nFailure Breakdown:")
         for category, pct in sorted(fb['percentages'].items(), key=lambda x: -x[1]):
             count = fb['counts'].get(category, 0)
             lines.append(f"  {category:25} {pct:6.1%} ({count})")
