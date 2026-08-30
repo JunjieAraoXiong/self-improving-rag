@@ -15,6 +15,7 @@ University), Sean Wu (Pepperdine University)
 
 [[Current arXiv paper]](https://arxiv.org/abs/2608.26706) ·
 [[v2 architecture]](docs/architecture-v2.md) ·
+[[v3 system proposal]](docs/architecture-v3.md) ·
 [[data notice]](DATA_NOTICE.md)
 
 > The list above mirrors the original repository/workshop record. arXiv v1
@@ -275,8 +276,16 @@ tests/                        # offline and adversarial regression suite
 - FrontierFinance-style web, filing, market-data, calculator, and long-document
   tools are a research roadmap, not implemented capabilities in this repo.
 
-See [docs/architecture-v2.md](docs/architecture-v2.md) for the assurance model,
-failure taxonomy, and experiment roadmap.
+The proposed v3 architecture adds a typed, multi-source evidence graph,
+structured XBRL/table adapters, as-of-time enforcement, contradiction
+preservation, budget-aware recovery, and deterministic replay. It deliberately
+uses one controller with typed tools rather than a peer-to-peer agent swarm.
+Those components are a staged design, not implemented capabilities or reported
+results.
+
+See [docs/architecture-v2.md](docs/architecture-v2.md) for the implemented
+assurance model and [docs/architecture-v3.md](docs/architecture-v3.md) for the
+upgraded system design, contracts, migration gates, and experiment plan.
 
 ## Data, license, and citation
 
