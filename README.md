@@ -20,8 +20,8 @@ This repository contains two related systems:
    *Towards Expert Financial QA via Self-Improving RAG*, accepted at the AFA
    Workshop @ ICLR 2026.
 
-Junjie Xiong (UC Berkeley), Shawheen Ghezavat (Cal Poly), Aum Hirpara (Hofstra
-University), Sean Wu (Pepperdine University)
+Junjie Xiong (Maths + CS Undergraduate at UC Berkeley), Shawheen Ghezavat (MS CS at Cal Poly), Aum Hirpara (MS CS at Hofstra
+University), Sean Wu (CS PhD at Stanford University)
 
 [[Current arXiv paper]](https://arxiv.org/abs/2608.26706) ·
 [[v2 architecture]](docs/architecture-v2.md) ·
