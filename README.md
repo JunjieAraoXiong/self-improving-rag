@@ -1,5 +1,15 @@
 # Evidence-Gap-Driven Financial QA
 
+> **V3 proposal:** a verifiable financial research runtime with an immutable
+> question contract, typed evidence, deterministic execution, independent
+> verification, localized recovery, and a replayable run ledger.
+
+[![V3 verifiable financial research runtime system design](docs/assets/v3-system-design.png)](docs/assets/v3-system-design.png)
+
+[Read the v3 design](docs/architecture-v3.md) ·
+[Open the full-resolution diagram](docs/assets/v3-system-design.png) ·
+[Edit the Excalidraw source](docs/assets/v3-system-design.excalidraw)
+
 This repository contains two related systems:
 
 1. **`gap_driven_v2` (default):** an experimental financial-QA runtime that
@@ -16,7 +26,6 @@ University), Sean Wu (Pepperdine University)
 [[Current arXiv paper]](https://arxiv.org/abs/2608.26706) ·
 [[v2 architecture]](docs/architecture-v2.md) ·
 [[v3 system proposal]](docs/architecture-v3.md) ·
-[[v3 system diagram]](docs/assets/v3-system-design.png) ·
 [[data notice]](DATA_NOTICE.md)
 
 > The list above mirrors the original repository/workshop record. arXiv v1
