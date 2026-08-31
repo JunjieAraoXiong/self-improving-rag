@@ -16,6 +16,7 @@ University), Sean Wu (Pepperdine University)
 [[Current arXiv paper]](https://arxiv.org/abs/2608.26706) ·
 [[v2 architecture]](docs/architecture-v2.md) ·
 [[v3 system proposal]](docs/architecture-v3.md) ·
+[[v3 system diagram]](docs/assets/v3-system-design.png) ·
 [[data notice]](DATA_NOTICE.md)
 
 > The list above mirrors the original repository/workshop record. arXiv v1

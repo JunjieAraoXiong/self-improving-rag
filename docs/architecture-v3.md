@@ -75,6 +75,19 @@ not get to rewrite the value stored under that ID.
 
 ## Logical architecture
 
+The full system drawing emphasizes the runtime's three planes: an immutable
+`TaskSpec` control plane, typed evidence and deterministic verification on the
+main path, and a budgeted correction plane that repairs only the failed
+condition. Click the preview for the full-resolution diagram, or open the
+editable source to change it.
+
+[Open full-resolution PNG](assets/v3-system-design.png) ·
+[Open editable Excalidraw source](assets/v3-system-design.excalidraw)
+
+[![V3 verifiable financial research runtime: contract, evidence, verification, recovery, and immutable run ledger](assets/v3-system-design.png)](assets/v3-system-design.png)
+
+The Mermaid view below is the compact, text-native component map.
+
 ```mermaid
 flowchart LR
     Q[Question] --> TC[Task compiler]
@@ -93,7 +106,7 @@ flowchart LR
     M --> N
     W --> N
 
-    N --> EG[Typed evidence graph]
+    N -->|new immutable snapshot| EG[Typed evidence graph]
     EG --> PB[Program binder]
     PB --> EX[Trusted executor]
     EX --> DP[Draft package]
@@ -104,12 +117,21 @@ flowchart LR
     V -->|passed| VA[Verified artifact]
     VA --> R[Deterministic renderer]
     R --> A[Verified answer]
-    V -->|localized issue| RP[Recovery policy]
+    TC -.-> IS[Typed issue stream]
+    ER -.-> IS
+    N -.-> IS
+    PB -.-> IS
+    EX -.-> IS
+    V -.-> IS
+    R -.-> IS
+    IS --> RP[Recovery policy]
     RP -->|missing evidence| ER
-    RP -->|conflict| CR[Reconciler]
-    CR --> EG
+    RP -->|renormalize or reconcile| N
     RP -->|arithmetic| EX
-    RP -->|unresolved or over budget| H[Abstain or human review]
+    RP -->|needs input| C[Clarification or human review]
+    C -->|approved| RP
+    C -->|unresolved| H[Abstain]
+    RP -->|over budget| H
 
     TC -.-> L[Immutable run ledger]
     ER -.-> L
@@ -121,6 +143,8 @@ flowchart LR
     VA -.-> L
     R -.-> L
     RP -.-> L
+    B[Budget ledger] -.-> RP
+    B -.-> L
 ```
 
 The diagram describes logical boundaries. The initial implementation should be
